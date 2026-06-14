@@ -70,8 +70,14 @@ class Learner(Process):
                 batch = self.replay_buffer.sample(self.config['batch_size'])
                 obs = torch.tensor(batch['state']['observation']).to(device)
                 mask = torch.tensor(batch['state']['action_mask']).to(device)
+                glob_data = batch['state'].get('global')
+                if glob_data is None:
+                    glob = torch.zeros((obs.size(0), 10), device = device, dtype = torch.float)
+                else:
+                    glob = torch.tensor(glob_data).to(device)
                 states = {
                     'observation': obs,
+                    'global': glob,
                     'action_mask': mask
                 }
                 actions = torch.tensor(batch['action']).unsqueeze(-1).to(device)

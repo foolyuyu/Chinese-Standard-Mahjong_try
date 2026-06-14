@@ -9,7 +9,14 @@ import numpy as np
 import torch
 
 def obs2response(model, obs):
-    logits, value = model({'observation': torch.from_numpy(np.expand_dims(obs['observation'], 0)), 'action_mask': torch.from_numpy(np.expand_dims(obs['action_mask'], 0))})
+    glob = obs.get('global')
+    if glob is None:
+        glob = np.zeros(10, dtype = np.float32)
+    logits, value = model({
+        'observation': torch.from_numpy(np.expand_dims(obs['observation'], 0)),
+        'global': torch.from_numpy(np.expand_dims(glob, 0)),
+        'action_mask': torch.from_numpy(np.expand_dims(obs['action_mask'], 0))
+    })
     action = logits.detach().numpy().flatten().argmax()
     response = agent.action2response(action)
     return response

@@ -57,6 +57,7 @@ class Actor(Process):
                 episode_data = {agent_name: {
                     'state' : {
                         'observation': [],
+                        'global': [],
                         'action_mask': []
                     },
                     'action' : [],
@@ -72,8 +73,10 @@ class Actor(Process):
                         agent_data = episode_data[agent_name]
                         state = obs[agent_name]
                         agent_data['state']['observation'].append(state['observation'])
+                        agent_data['state']['global'].append(state['global'])
                         agent_data['state']['action_mask'].append(state['action_mask'])
                         state['observation'] = torch.tensor(state['observation'], dtype = torch.float).unsqueeze(0)
+                        state['global'] = torch.tensor(state['global'], dtype = torch.float).unsqueeze(0)
                         state['action_mask'] = torch.tensor(state['action_mask'], dtype = torch.float).unsqueeze(0)
                         model.train(False) # Batch Norm inference mode
                         with torch.no_grad():
@@ -99,6 +102,7 @@ class Actor(Process):
                     if len(agent_data['action']) < len(agent_data['reward']):
                         agent_data['reward'].pop(0)
                     obs = np.stack(agent_data['state']['observation'])
+                    glob = np.stack(agent_data['state']['global'])
                     mask = np.stack(agent_data['state']['action_mask'])
                     actions = np.array(agent_data['action'], dtype = np.int64)
                     rewards = np.array(agent_data['reward'], dtype = np.float32)
@@ -119,6 +123,7 @@ class Actor(Process):
                     payload = {
                         'state': {
                             'observation': obs,
+                            'global': glob,
                             'action_mask': mask
                         },
                         'action': actions,
