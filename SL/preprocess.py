@@ -1,38 +1,227 @@
 from feature import FeatureAgent
-import numpy as np
+import argparse
 import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
 
-obs = [[] for i in range(4)]
-actions = [[] for i in range(4)]
+import numpy as np
+
+
+# Toggle here when you want to switch between local disk and OBS.
+# USE_OBS_IO = False
+USE_OBS_IO = True
+
+# Change this to your actual OBS bucket name.
+BUCKET_NAME = 'mahjong-data'
+OBS_DATA_PREFIX = f'obs://{BUCKET_NAME}/SL/data'
+
+# Toggle here when you want to switch between one-match-per-file and sharded output.
+# USE_SHARDS = False
+USE_SHARDS = True
+
+# Tune this if you want bigger or smaller shard files.
+SHARD_SAMPLE_LIMIT = 90000
+
+# Local mode:
+# INPUT_FILE = 'data/data.txt'
+# OUTPUT_DIR = 'data'
+
+# OBS mode:
+# INPUT_FILE = f'{OBS_DATA_PREFIX}/data.txt'
+# OUTPUT_DIR = OBS_DATA_PREFIX
+
+INPUT_FILE = f'{OBS_DATA_PREFIX}/data.txt' if USE_OBS_IO else 'data/data.txt'
+OUTPUT_DIR = OBS_DATA_PREFIX if USE_OBS_IO else 'data'
+
+obs = [[] for _ in range(4)]
+actions = [[] for _ in range(4)]
 matchid = -1
-
 l = []
+base_dir = Path(__file__).resolve().parent
+
+if USE_SHARDS:
+    shard_id = 0
+    shard_sample_count = 0
+    shard_match_counts = []
+    shard_obs = []
+    shard_glob = []
+    shard_mask = []
+    shard_act = []
+    shard_manifest = []
+
+
+def _is_obs_path(path):
+    return str(path).startswith('obs://')
+
+
+def _load_mox():
+    try:
+        import moxing as mox  # type: ignore
+    except Exception:
+        return None
+    return mox
+
+
+def _resolve_local_path(path):
+    path = Path(path)
+    return path if path.is_absolute() else base_dir / path
+
+
+def _save_npz(output_dir, name, **payload):
+    if _is_obs_path(output_dir):
+        mox = _load_mox()
+        if mox is None:
+            raise RuntimeError('OBS output requires moxing in ModelArts.')
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix = '.npz', delete = False) as tmp:
+                tmp_path = tmp.name
+            np.savez(tmp_path, **payload)
+            dest = f"{str(output_dir).rstrip('/')}/{name}.npz"
+            mox.file.copy(tmp_path, dest)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        return
+
+    output_path = _resolve_local_path(output_dir)
+    output_path.mkdir(parents = True, exist_ok = True)
+    np.savez(output_path / f'{name}.npz', **payload)
+
+
+def _save_json(output_dir, name, payload):
+    if _is_obs_path(output_dir):
+        mox = _load_mox()
+        if mox is None:
+            raise RuntimeError('OBS output requires moxing in ModelArts.')
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode = 'w', suffix = '.json', encoding = 'utf-8', delete = False) as tmp:
+                tmp_path = tmp.name
+                json.dump(payload, tmp)
+            dest = f"{str(output_dir).rstrip('/')}/{name}.json"
+            mox.file.copy(tmp_path, dest)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        return
+
+    output_path = _resolve_local_path(output_dir)
+    output_path.mkdir(parents = True, exist_ok = True)
+    with open(output_path / f'{name}.json', 'w', encoding = 'utf-8') as f:
+        json.dump(payload, f)
+
+
+def _open_input_file(input_file):
+    if _is_obs_path(input_file):
+        mox = _load_mox()
+        if mox is None:
+            raise RuntimeError('OBS input requires moxing in ModelArts.')
+        tmp_dir = tempfile.mkdtemp(prefix = 'sl_preprocess_')
+        local_path = os.path.join(tmp_dir, Path(str(input_file)).name or 'data.txt')
+        mox.file.copy(str(input_file), local_path)
+        return open(local_path, encoding = 'UTF-8'), tmp_dir
+
+    return open(_resolve_local_path(input_file), encoding = 'UTF-8'), None
+
 
 def filterData():
     global obs
     global actions
-    newobs = [[] for i in range(4)]
-    newactions = [[] for i in range(4)]
+    newobs = [[] for _ in range(4)]
+    newactions = [[] for _ in range(4)]
     for i in range(4):
         for j, o in enumerate(obs[i]):
-            if o['action_mask'].sum() > 1: # ignore states with single valid action (Pass)
+            if o['action_mask'].sum() > 1:  # ignore states with single valid action (Pass)
                 newobs[i].append(o)
                 newactions[i].append(actions[i][j])
     obs = newobs
     actions = newactions
 
-def saveData():
-    assert [len(x) for x in obs] == [len(x) for x in actions], 'obs actions not matching!'
-    l.append(sum([len(x) for x in obs]))
-    np.savez('data/%d.npz'%matchid
-        , obs = np.stack([x['observation'] for i in range(4) for x in obs[i]]).astype(np.int8)
-        , mask = np.stack([x['action_mask'] for i in range(4) for x in obs[i]]).astype(np.int8)
-        , act = np.array([x for i in range(4) for x in actions[i]])
-    )
-    for x in obs: x.clear()
-    for x in actions: x.clear()
 
-with open('data/data.txt', encoding='UTF-8') as f:
+def _materialize_match():
+    assert [len(x) for x in obs] == [len(x) for x in actions], 'obs actions not matching!'
+    match_samples = sum([len(x) for x in obs])
+    l.append(match_samples)
+    payload = {
+        'obs': np.stack([x['observation'] for i in range(4) for x in obs[i]]).astype(np.int8),
+        'glob': np.stack([x['global'] for i in range(4) for x in obs[i]]).astype(np.int8),
+        'mask': np.stack([x['action_mask'] for i in range(4) for x in obs[i]]).astype(np.int8),
+        'act': np.array([x for i in range(4) for x in actions[i]]),
+    }
+    return match_samples, payload
+
+
+def _clear_match_buffers():
+    for x in obs:
+        x.clear()
+    for x in actions:
+        x.clear()
+
+
+def _flush_shard():
+    global shard_id
+    global shard_sample_count
+    global shard_match_counts
+    global shard_obs
+    global shard_glob
+    global shard_mask
+    global shard_act
+    global shard_manifest
+
+    if shard_sample_count == 0:
+        return
+
+    payload = {
+        'obs': np.concatenate(shard_obs, axis = 0),
+        'glob': np.concatenate(shard_glob, axis = 0),
+        'mask': np.concatenate(shard_mask, axis = 0),
+        'act': np.concatenate(shard_act, axis = 0),
+        'match_counts': np.array(shard_match_counts, dtype = np.int32),
+    }
+    _save_npz(OUTPUT_DIR, f'shard_{shard_id:05d}', **payload)
+    print('Saved shard %d with %d samples and %d matches.' % (shard_id, shard_sample_count, len(shard_match_counts)))
+    shard_manifest.append({
+        'file': f'shard_{shard_id:05d}.npz',
+        'samples': int(shard_sample_count),
+        'matches': int(len(shard_match_counts)),
+        'match_counts': [int(x) for x in shard_match_counts],
+    })
+    shard_id += 1
+    shard_sample_count = 0
+    shard_match_counts = []
+    shard_obs = []
+    shard_glob = []
+    shard_mask = []
+    shard_act = []
+
+
+def _append_match_to_shard(match_samples, payload):
+    global shard_sample_count
+    global shard_match_counts
+    global shard_obs
+    global shard_glob
+    global shard_mask
+    global shard_act
+
+    if shard_sample_count and shard_sample_count + match_samples > SHARD_SAMPLE_LIMIT:
+        _flush_shard()
+
+    shard_sample_count += match_samples
+    shard_match_counts.append(match_samples)
+    shard_obs.append(payload['obs'])
+    shard_glob.append(payload['glob'])
+    shard_mask.append(payload['mask'])
+    shard_act.append(payload['act'])
+
+    if shard_sample_count >= SHARD_SAMPLE_LIMIT:
+        _flush_shard()
+
+
+f, _tmp_dir = _open_input_file(INPUT_FILE)
+try:
     line = f.readline()
     while line:
         t = line.split()
@@ -128,10 +317,31 @@ with open('data/data.txt', encoding='UTF-8') as f:
                         elif t[k + 2] == 'Hu':
                             actions[p].pop()
                             actions[p].append(agents[p].response2action('Hu'))
-                    else: break
+                    else:
+                        break
         elif t[0] == 'Score':
             filterData()
-            saveData()
+            if USE_SHARDS:
+                match_samples, payload = _materialize_match()
+                _append_match_to_shard(match_samples, payload)
+            else:
+                match_samples, payload = _materialize_match()
+                _save_npz(OUTPUT_DIR, '%d' % matchid, **payload)
+            _clear_match_buffers()
         line = f.readline()
-with open('data/count.json', 'w') as f:
-    json.dump(l, f)
+finally:
+    f.close()
+    if _tmp_dir is not None:
+        shutil.rmtree(_tmp_dir, ignore_errors = True)
+
+if USE_SHARDS:
+    _flush_shard()
+    _save_json(OUTPUT_DIR, 'count', {
+        'schema': 'sharded-v1',
+        'shard_sample_limit': SHARD_SAMPLE_LIMIT,
+        'total_matches': len(l),
+        'total_samples': int(sum(l)),
+        'shards': shard_manifest,
+    })
+else:
+    _save_json(OUTPUT_DIR, 'count', l)
