@@ -2,24 +2,11 @@ from agent import MahjongGBAgent
 from collections import defaultdict
 import numpy as np
 
-USE_MAHJONGGB = True
-MahjongFanCalculator = None
-_MAHJONGGB_LOAD_FAILED = False
-
-
-def _mahjong_fan_calculator():
-    global MahjongFanCalculator
-    global _MAHJONGGB_LOAD_FAILED
-    if not USE_MAHJONGGB or _MAHJONGGB_LOAD_FAILED:
-        return None
-    if MahjongFanCalculator is None:
-        try:
-            from MahjongGB import MahjongFanCalculator as _MahjongFanCalculator
-            MahjongFanCalculator = _MahjongFanCalculator
-        except Exception:
-            _MAHJONGGB_LOAD_FAILED = True
-            return None
-    return MahjongFanCalculator
+try:
+    from MahjongGB import MahjongFanCalculator
+except:
+    print('MahjongGB library required! Please visit https://github.com/ailab-pku/PyMahjongGB for more information.')
+    raise
 
 
 class FeatureAgent(MahjongGBAgent):
@@ -444,11 +431,8 @@ class FeatureAgent(MahjongGBAgent):
             self.obs[begin + remaining, idx] = 1
 
     def _check_mahjong(self, winTile, isSelfDrawn = False, isAboutKong = False):
-        calculator = _mahjong_fan_calculator()
-        if calculator is None:
-            return False
         try:
-            fans = calculator(
+            fans = MahjongFanCalculator(
                 pack = tuple(self.packs[0]),
                 hand = tuple(self.hand),
                 winTile = winTile,

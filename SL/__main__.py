@@ -112,7 +112,7 @@ if __name__ == '__main__':
                     print('GANG %s' % t[1], flush = True)
                     angang = t[1]
                 elif t[0] == 'AnGang':
-                    print('ANGANG %s' % t[1], flush = True)
+                    print('GANG %s' % t[1], flush = True)
                     angang = t[1]
                 elif t[0] == 'BuGang':
                     print('BUGANG %s' % t[1], flush = True)

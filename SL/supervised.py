@@ -67,6 +67,14 @@ def _append_metrics_row(metrics_path, row):
         writer.writerow(row)
 
 
+def _cpu_state_dict(model):
+    return {key: value.detach().cpu() for key, value in model.state_dict().items()}
+
+
+def _save_cpu_checkpoint(model, path):
+    torch.save(_cpu_state_dict(model), path)
+
+
 def _to_device(batch, device):
     obs = torch.from_numpy(batch['obs']).to(device)
     glob = torch.from_numpy(batch['glob']).to(device)
@@ -142,7 +150,7 @@ def _run_sharded_training(args, manifest, device, base_dir):
 
     for e in range(args.epochs):
         print('Epoch', e)
-        torch.save(model.state_dict(), logdir / 'checkpoint' / ('%d.pkl' % e))
+        _save_cpu_checkpoint(model, logdir / 'checkpoint' / ('%d.pkl' % e))
 
         rng = np.random.default_rng(seed = e)
         shard_order = list(range(len(shards)))
@@ -221,7 +229,7 @@ def _run_legacy_training(args, manifest, device, base_dir):
 
     for e in range(args.epochs):
         print('Epoch', e)
-        torch.save(model.state_dict(), logdir / 'checkpoint' / ('%d.pkl' % e))
+        _save_cpu_checkpoint(model, logdir / 'checkpoint' / ('%d.pkl' % e))
         train_loss_sum = 0.0
         train_count = 0
         for i, d in enumerate(loader):

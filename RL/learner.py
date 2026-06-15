@@ -9,6 +9,11 @@ from replay_buffer import ReplayBuffer
 from model_pool import ModelPoolServer
 from model import CNNModel
 
+
+def _cpu_state_dict(model):
+    return {key: value.detach().cpu() for key, value in model.state_dict().items()}
+
+
 def _npu_available():
     try:
         import torch_npu  # noqa: F401
@@ -53,7 +58,7 @@ class Learner(Process):
             model = CNNModel()
             
             # send to model pool
-            model_pool.push(model.state_dict()) # push cpu-only tensor to model_pool
+            model_pool.push(model.state_dict()) # initial model is still on CPU
             model = model.to(device)
             
             # training
@@ -108,13 +113,13 @@ class Learner(Process):
                     optimizer.step()
 
                 # push new model (without moving the entire module between CPU/GPU)
-                model_pool.push({k: v.detach().cpu() for k, v in model.state_dict().items()})
+                model_pool.push(_cpu_state_dict(model))
                 
                 # save checkpoints
                 t = time.time()
                 if t - cur_time > self.config['ckpt_save_interval']:
                     path = self.config['ckpt_save_path'] + 'model_%d.pt' % iterations
-                    torch.save(model.state_dict(), path)
+                    torch.save(_cpu_state_dict(model), path)
                     cur_time = t
                 iterations += 1
         finally:

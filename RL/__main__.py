@@ -95,7 +95,7 @@ if __name__ == '__main__':
                     print('GANG %s' % response[1], flush = True)
                     angang = response[1]
                 elif response[0] == 'AnGang':
-                    print('ANGANG %s' % response[1], flush = True)
+                    print('GANG %s' % response[1], flush = True)
                     angang = response[1]
                 elif response[0] == 'BuGang':
                     print('BUGANG %s' % response[1], flush = True)

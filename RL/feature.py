@@ -4,8 +4,9 @@ import numpy as np
 
 try:
     from MahjongGB import MahjongFanCalculator
-except ImportError:
-    MahjongFanCalculator = None
+except:
+    print('MahjongGB library required! Please visit https://github.com/ailab-pku/PyMahjongGB for more information.')
+    raise
 
 
 class FeatureAgent(MahjongGBAgent):
@@ -430,8 +431,6 @@ class FeatureAgent(MahjongGBAgent):
             self.obs[begin + remaining, idx] = 1
 
     def _check_mahjong(self, winTile, isSelfDrawn = False, isAboutKong = False):
-        if MahjongFanCalculator is None:
-            return False
         try:
             fans = MahjongFanCalculator(
                 pack = tuple(self.packs[0]),
