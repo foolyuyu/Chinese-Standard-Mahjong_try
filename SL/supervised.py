@@ -1,5 +1,6 @@
 from pathlib import Path
 import argparse
+import csv
 import random
 
 import numpy as np
@@ -42,6 +43,28 @@ def _maybe_set_npu(device):
         import torch_npu  # noqa: F401
         if hasattr(torch, 'npu') and hasattr(torch.npu, 'set_device'):
             torch.npu.set_device(0)
+
+
+def _resolve_metrics_path(args, base_dir):
+    if args.metrics_file:
+        metrics_path = Path(args.metrics_file)
+    else:
+        logdir = Path(args.logdir) if args.logdir else base_dir / 'model'
+        metrics_path = logdir / 'metrics.csv'
+    metrics_path.parent.mkdir(parents = True, exist_ok = True)
+    if metrics_path.exists():
+        metrics_path.unlink()
+    return metrics_path
+
+
+def _append_metrics_row(metrics_path, row):
+    fieldnames = ['epoch', 'mode', 'train_loss', 'validate_acc', 'train_samples', 'validate_samples']
+    write_header = not metrics_path.exists()
+    with metrics_path.open('a', newline = '', encoding = 'utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames = fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def _to_device(batch, device):
@@ -109,6 +132,7 @@ def _run_sharded_training(args, manifest, device, base_dir):
     data_dir = args.data_dir
     logdir = Path(args.logdir) if args.logdir else base_dir / 'model'
     (logdir / 'checkpoint').mkdir(parents = True, exist_ok = True)
+    metrics_path = _resolve_metrics_path(args, base_dir)
 
     model = CNNModel().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
@@ -158,12 +182,21 @@ def _run_sharded_training(args, manifest, device, base_dir):
         avg_loss = train_loss_sum / train_count if train_count else 0.0
         avg_acc = val_correct / val_count if val_count else 0.0
         print('Epoch', e + 1, 'train_loss:', avg_loss, 'validate_acc:', avg_acc)
+        _append_metrics_row(metrics_path, {
+            'epoch': e + 1,
+            'mode': 'sharded',
+            'train_loss': avg_loss,
+            'validate_acc': avg_acc,
+            'train_samples': train_count,
+            'validate_samples': val_count,
+        })
 
 
 def _run_legacy_training(args, manifest, device, base_dir):
     # Legacy one-match-per-file mode kept for local fallback.
     logdir = Path(args.logdir) if args.logdir else base_dir / 'model'
     (logdir / 'checkpoint').mkdir(parents = True, exist_ok = True)
+    metrics_path = _resolve_metrics_path(args, base_dir)
 
     trainDataset = MahjongGBDataset(0, args.split_ratio, True, data_dir = args.data_dir)
     validateDataset = MahjongGBDataset(args.split_ratio, 1, False, data_dir = args.data_dir)
@@ -189,6 +222,8 @@ def _run_legacy_training(args, manifest, device, base_dir):
     for e in range(args.epochs):
         print('Epoch', e)
         torch.save(model.state_dict(), logdir / 'checkpoint' / ('%d.pkl' % e))
+        train_loss_sum = 0.0
+        train_count = 0
         for i, d in enumerate(loader):
             input_dict = {'is_training': True, 'obs': {'observation': d[0].to(device), 'global': d[1].to(device), 'action_mask': d[2].to(device)}}
             logits = model(input_dict)
@@ -198,16 +233,30 @@ def _run_legacy_training(args, manifest, device, base_dir):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            batch_count = len(d[3])
+            train_loss_sum += loss.item() * batch_count
+            train_count += batch_count
         print('Run validation:')
         correct = 0
+        val_count = 0
         for i, d in enumerate(vloader):
             input_dict = {'is_training': False, 'obs': {'observation': d[0].to(device), 'global': d[1].to(device), 'action_mask': d[2].to(device)}}
             with torch.no_grad():
                 logits = model(input_dict)
                 pred = logits.argmax(dim = 1)
                 correct += torch.eq(pred, d[3].to(device)).sum().item()
-        acc = correct / len(validateDataset)
+                val_count += len(d[3])
+        acc = correct / val_count if val_count else 0.0
+        avg_loss = train_loss_sum / train_count if train_count else 0.0
         print('Epoch', e + 1, 'Validate acc:', acc)
+        _append_metrics_row(metrics_path, {
+            'epoch': e + 1,
+            'mode': 'legacy',
+            'train_loss': avg_loss,
+            'validate_acc': acc,
+            'train_samples': train_count,
+            'validate_samples': val_count,
+        })
 
 
 if __name__ == '__main__':
@@ -229,6 +278,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type = float, default = 5e-4)
     parser.add_argument('--device', type = str, default = 'auto', choices = ['auto', 'cpu', 'cuda', 'npu'])
     parser.add_argument('--num-workers', type = int, default = 0)
+    parser.add_argument('--metrics-file', type = str, default = None, help = 'CSV file for per-epoch metrics')
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent
