@@ -5,7 +5,7 @@ import sys
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 
-DATA_DIR = '/data/19.pkl'
+DATA_DIR = '/data/41.pkl'
 DEBUG = False
 _MODEL = None
 FeatureAgent = None

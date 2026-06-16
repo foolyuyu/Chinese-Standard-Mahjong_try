@@ -1,6 +1,7 @@
 from replay_buffer import ReplayBuffer
 from actor import Actor
 from learner import Learner
+import argparse
 import signal
 import torch
 import os
@@ -13,7 +14,18 @@ def _npu_available():
         return False
     return hasattr(torch, 'npu') and hasattr(torch.npu, 'is_available') and torch.npu.is_available()
 
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description = 'RL training for MahjongGB')
+    parser.add_argument('--sl-init-checkpoint', type = str, default = None, help = 'Optional SL checkpoint used to initialize the RL policy')
+    parser.add_argument('--lr', type = float, default = None, help = 'Override RL learner learning rate')
+    parser.add_argument('--device', type = str, default = None, choices = ['auto', 'cpu', 'cuda', 'npu'], help = 'Override training device')
+    parser.add_argument('--num-actors', type = int, default = None, help = 'Override number of actor processes')
+    parser.add_argument('--ckpt-save-path', type = str, default = None, help = 'Override RL checkpoint output directory')
+    return parser.parse_args()
+
 if __name__ == '__main__':
+    args = _parse_args()
     base_dir = os.path.dirname(os.path.abspath(__file__))
     config = {
         'replay_buffer_size': 50000,
@@ -33,8 +45,20 @@ if __name__ == '__main__':
         'entropy_coeff': 0.01,
         'device': 'npu',
         'ckpt_save_interval': 300,
-        'ckpt_save_path': os.path.join(base_dir, 'checkpoint') + os.sep
+        'ckpt_save_path': os.path.join(base_dir, 'checkpoint') + os.sep,
+        'sl_init_checkpoint': None
     }
+
+    if args.sl_init_checkpoint:
+        config['sl_init_checkpoint'] = args.sl_init_checkpoint
+    if args.lr is not None:
+        config['lr'] = args.lr
+    if args.device is not None:
+        config['device'] = args.device
+    if args.num_actors is not None:
+        config['num_actors'] = args.num_actors
+    if args.ckpt_save_path is not None:
+        config['ckpt_save_path'] = os.path.abspath(args.ckpt_save_path) + os.sep
 
     requested_device = str(config.get('device', 'cpu')).strip().lower()
     if requested_device == 'auto':

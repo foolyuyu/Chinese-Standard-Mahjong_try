@@ -14,6 +14,57 @@ def _cpu_state_dict(model):
     return {key: value.detach().cpu() for key, value in model.state_dict().items()}
 
 
+def _extract_state_dict(checkpoint):
+    if not isinstance(checkpoint, dict):
+        return checkpoint
+    for key in ('state_dict', 'model_state_dict', 'model'):
+        value = checkpoint.get(key)
+        if isinstance(value, dict):
+            return value
+    return checkpoint
+
+
+def _load_sl_policy_checkpoint(model, checkpoint_path):
+    if not checkpoint_path:
+        return
+
+    checkpoint = torch.load(checkpoint_path, map_location = torch.device('cpu'))
+    sl_state = _extract_state_dict(checkpoint)
+    model_state = model.state_dict()
+    loaded = []
+    skipped = []
+
+    for key, value in sl_state.items():
+        source_key = key[7:] if key.startswith('module.') else key
+        if source_key.startswith('_tower.'):
+            target_key = source_key
+        elif source_key.startswith('_global_tower.'):
+            target_key = source_key
+        elif source_key.startswith('_tower_head.'):
+            target_key = '_logits.' + source_key[len('_tower_head.'):]
+        else:
+            skipped.append(source_key)
+            continue
+
+        if target_key not in model_state:
+            skipped.append(source_key)
+            continue
+        if tuple(model_state[target_key].shape) != tuple(value.shape):
+            skipped.append(source_key)
+            continue
+        model_state[target_key] = value.detach().cpu()
+        loaded.append((source_key, target_key))
+
+    if not loaded:
+        raise RuntimeError('No compatible SL policy weights loaded from %s' % checkpoint_path)
+
+    model.load_state_dict(model_state)
+    print('Loaded SL policy checkpoint:', checkpoint_path)
+    print('Loaded %d tensors into RL policy; value branch remains initialized for RL.' % len(loaded))
+    if skipped:
+        print('Skipped %d incompatible or unused tensors from SL checkpoint.' % len(skipped))
+
+
 def _npu_available():
     try:
         import torch_npu  # noqa: F401
@@ -56,6 +107,7 @@ class Learner(Process):
                 requested_device = 'cpu'
             device = torch.device(requested_device)
             model = CNNModel()
+            _load_sl_policy_checkpoint(model, self.config.get('sl_init_checkpoint'))
             
             # send to model pool
             model_pool.push(model.state_dict()) # initial model is still on CPU

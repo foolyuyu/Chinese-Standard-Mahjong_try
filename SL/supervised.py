@@ -52,7 +52,7 @@ def _resolve_metrics_path(args, base_dir):
         logdir = Path(args.logdir) if args.logdir else base_dir / 'model'
         metrics_path = logdir / 'metrics.csv'
     metrics_path.parent.mkdir(parents = True, exist_ok = True)
-    if metrics_path.exists():
+    if metrics_path.exists() and not args.append_metrics:
         metrics_path.unlink()
     return metrics_path
 
@@ -73,6 +73,23 @@ def _cpu_state_dict(model):
 
 def _save_cpu_checkpoint(model, path):
     torch.save(_cpu_state_dict(model), path)
+
+
+def _fixed_split_indices(n, split_ratio, seed):
+    indices = np.arange(n)
+    rng = np.random.default_rng(seed = seed)
+    rng.shuffle(indices)
+    split_point = int(n * split_ratio)
+    split_point = min(max(split_point, 1), n) if n > 1 else n
+    return indices[:split_point], indices[split_point:]
+
+
+def _load_resume_checkpoint(model, resume_path, device):
+    if not resume_path:
+        return
+    state_dict = torch.load(resume_path, map_location = device)
+    model.load_state_dict(state_dict)
+    print('Loaded resume checkpoint:', resume_path)
 
 
 def _to_device(batch, device):
@@ -143,18 +160,19 @@ def _run_sharded_training(args, manifest, device, base_dir):
     metrics_path = _resolve_metrics_path(args, base_dir)
 
     model = CNNModel().to(device)
+    _load_resume_checkpoint(model, args.resume, device)
     optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
     shards = list(manifest.get('shards', []))
     if not shards:
         raise RuntimeError('Shard manifest is empty.')
 
-    for e in range(args.epochs):
+    for e in range(args.start_epoch, args.start_epoch + args.epochs):
         print('Epoch', e)
         _save_cpu_checkpoint(model, logdir / 'checkpoint' / ('%d.pkl' % e))
 
-        rng = np.random.default_rng(seed = e)
+        epoch_rng = np.random.default_rng(seed = e)
         shard_order = list(range(len(shards)))
-        rng.shuffle(shard_order)
+        epoch_rng.shuffle(shard_order)
 
         train_loss_sum = 0.0
         train_count = 0
@@ -168,12 +186,9 @@ def _run_sharded_training(args, manifest, device, base_dir):
             if n == 0:
                 continue
 
-            indices = np.arange(n)
-            rng.shuffle(indices)
-            split_point = int(n * args.split_ratio)
-            split_point = min(max(split_point, 1), n) if n > 1 else n
-            train_idx = indices[:split_point]
-            val_idx = indices[split_point:]
+            train_idx, val_idx = _fixed_split_indices(n, args.split_ratio, args.split_seed + shard_idx)
+            train_idx = train_idx.copy()
+            epoch_rng.shuffle(train_idx)
 
             if len(train_idx):
                 loss_sum, count = _train_on_indices(model, optimizer, arrays, train_idx, device, args.batch_size, e, shard['file'])
@@ -225,9 +240,10 @@ def _run_legacy_training(args, manifest, device, base_dir):
 
     print('Using device:', device)
     model = CNNModel().to(device)
+    _load_resume_checkpoint(model, args.resume, device)
     optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
 
-    for e in range(args.epochs):
+    for e in range(args.start_epoch, args.start_epoch + args.epochs):
         print('Epoch', e)
         _save_cpu_checkpoint(model, logdir / 'checkpoint' / ('%d.pkl' % e))
         train_loss_sum = 0.0
@@ -287,6 +303,10 @@ if __name__ == '__main__':
     parser.add_argument('--device', type = str, default = 'auto', choices = ['auto', 'cpu', 'cuda', 'npu'])
     parser.add_argument('--num-workers', type = int, default = 0)
     parser.add_argument('--metrics-file', type = str, default = None, help = 'CSV file for per-epoch metrics')
+    parser.add_argument('--resume', type = str, default = None, help = 'Checkpoint path to continue training from')
+    parser.add_argument('--start-epoch', type = int, default = 0, help = 'Epoch number used for resumed checkpoint naming and metrics')
+    parser.add_argument('--append-metrics', action = 'store_true', help = 'Append to an existing metrics CSV instead of replacing it')
+    parser.add_argument('--split-seed', type = int, default = 20240616, help = 'Seed used for fixed sharded train/validation split')
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent
