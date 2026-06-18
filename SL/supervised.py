@@ -75,6 +75,10 @@ def _save_cpu_checkpoint(model, path):
     torch.save(_cpu_state_dict(model), path)
 
 
+def _save_best_checkpoint(model, logdir):
+    _save_cpu_checkpoint(model, logdir / 'best.pkl')
+
+
 def _fixed_split_indices(n, split_ratio, seed):
     indices = np.arange(n)
     rng = np.random.default_rng(seed = seed)
@@ -100,7 +104,7 @@ def _to_device(batch, device):
     return obs, glob, mask, act
 
 
-def _train_on_indices(model, optimizer, arrays, indices, device, batch_size, epoch, shard_name):
+def _train_on_indices(model, optimizer, arrays, indices, device, batch_size, grad_clip, epoch, shard_name):
     model.train(True)
     total_loss = 0.0
     total_count = 0
@@ -120,6 +124,8 @@ def _train_on_indices(model, optimizer, arrays, indices, device, batch_size, epo
         loss = F.cross_entropy(logits, act)
         optimizer.zero_grad()
         loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         total_loss += loss.item() * len(batch_idx)
         total_count += len(batch_idx)
@@ -161,10 +167,14 @@ def _run_sharded_training(args, manifest, device, base_dir):
 
     model = CNNModel().to(device)
     _load_resume_checkpoint(model, args.resume, device)
-    optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr = args.lr, weight_decay = args.weight_decay)
     shards = list(manifest.get('shards', []))
     if not shards:
         raise RuntimeError('Shard manifest is empty.')
+
+    best_acc = float('-inf')
+    best_epoch = None
+    epochs_without_improvement = 0
 
     for e in range(args.start_epoch, args.start_epoch + args.epochs):
         print('Epoch', e)
@@ -191,7 +201,7 @@ def _run_sharded_training(args, manifest, device, base_dir):
             epoch_rng.shuffle(train_idx)
 
             if len(train_idx):
-                loss_sum, count = _train_on_indices(model, optimizer, arrays, train_idx, device, args.batch_size, e, shard['file'])
+                loss_sum, count = _train_on_indices(model, optimizer, arrays, train_idx, device, args.batch_size, args.grad_clip, e, shard['file'])
                 train_loss_sum += loss_sum
                 train_count += count
 
@@ -213,6 +223,20 @@ def _run_sharded_training(args, manifest, device, base_dir):
             'train_samples': train_count,
             'validate_samples': val_count,
         })
+
+        if avg_acc > best_acc:
+            best_acc = avg_acc
+            best_epoch = e + 1
+            epochs_without_improvement = 0
+            _save_best_checkpoint(model, logdir)
+            print('New best validation accuracy:', best_acc, 'at epoch', best_epoch)
+        else:
+            epochs_without_improvement += 1
+            print('No improvement for', epochs_without_improvement, 'epoch(s). Best epoch:', best_epoch, 'best acc:', best_acc)
+
+        if args.patience >= 0 and epochs_without_improvement >= args.patience:
+            print('Early stopping triggered at epoch', e + 1, 'best epoch:', best_epoch, 'best acc:', best_acc)
+            break
 
 
 def _run_legacy_training(args, manifest, device, base_dir):
@@ -241,7 +265,11 @@ def _run_legacy_training(args, manifest, device, base_dir):
     print('Using device:', device)
     model = CNNModel().to(device)
     _load_resume_checkpoint(model, args.resume, device)
-    optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr = args.lr, weight_decay = args.weight_decay)
+
+    best_acc = float('-inf')
+    best_epoch = None
+    epochs_without_improvement = 0
 
     for e in range(args.start_epoch, args.start_epoch + args.epochs):
         print('Epoch', e)
@@ -256,6 +284,8 @@ def _run_legacy_training(args, manifest, device, base_dir):
                 print('Iteration %d/%d' % (i, len(trainDataset) // args.batch_size + 1), 'policy_loss', loss.item())
             optimizer.zero_grad()
             loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             batch_count = len(d[3])
             train_loss_sum += loss.item() * batch_count
@@ -282,6 +312,20 @@ def _run_legacy_training(args, manifest, device, base_dir):
             'validate_samples': val_count,
         })
 
+        if acc > best_acc:
+            best_acc = acc
+            best_epoch = e + 1
+            epochs_without_improvement = 0
+            _save_best_checkpoint(model, logdir)
+            print('New best validation accuracy:', best_acc, 'at epoch', best_epoch)
+        else:
+            epochs_without_improvement += 1
+            print('No improvement for', epochs_without_improvement, 'epoch(s). Best epoch:', best_epoch, 'best acc:', best_acc)
+
+        if args.patience >= 0 and epochs_without_improvement >= args.patience:
+            print('Early stopping triggered at epoch', e + 1, 'best epoch:', best_epoch, 'best acc:', best_acc)
+            break
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Supervised training for MahjongGB')
@@ -300,6 +344,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type = int, default = 1024)
     parser.add_argument('--epochs', type = int, default = 20)
     parser.add_argument('--lr', type = float, default = 5e-4)
+    parser.add_argument('--weight-decay', type = float, default = 1e-4)
+    parser.add_argument('--grad-clip', type = float, default = 1.0)
     parser.add_argument('--device', type = str, default = 'auto', choices = ['auto', 'cpu', 'cuda', 'npu'])
     parser.add_argument('--num-workers', type = int, default = 0)
     parser.add_argument('--metrics-file', type = str, default = None, help = 'CSV file for per-epoch metrics')
@@ -307,6 +353,7 @@ if __name__ == '__main__':
     parser.add_argument('--start-epoch', type = int, default = 0, help = 'Epoch number used for resumed checkpoint naming and metrics')
     parser.add_argument('--append-metrics', action = 'store_true', help = 'Append to an existing metrics CSV instead of replacing it')
     parser.add_argument('--split-seed', type = int, default = 20240616, help = 'Seed used for fixed sharded train/validation split')
+    parser.add_argument('--patience', type = int, default = 3, help = 'Stop after this many consecutive epochs without validation improvement; use -1 to disable')
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent
