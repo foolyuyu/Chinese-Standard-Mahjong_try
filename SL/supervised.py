@@ -329,15 +329,7 @@ def _run_legacy_training(args, manifest, device, base_dir):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Supervised training for MahjongGB')
-    # Toggle here to switch default training data source.
-    USE_OBS_IO = False
-    # Change this to your actual OBS bucket name.
-    BUCKET_NAME = 'mahjong-data'
-    OBS_DATA_PREFIX = f'obs://{BUCKET_NAME}/SL/data'
-    # DATA_DIR = 'data'
-    # DATA_DIR = OBS_DATA_PREFIX
-    DATA_DIR = OBS_DATA_PREFIX if USE_OBS_IO else 'data'
-    parser.add_argument('--data-dir', type = str, default = DATA_DIR, help = 'Directory containing data.txt, count.json, and *.npz')
+    parser.add_argument('--data-dir', type = str, default = 'data', help = 'Local directory containing data.txt, count.json, and *.npz')
     parser.add_argument('--logdir', type = str, default = None, help = 'Directory for checkpoints and logs')
     parser.add_argument('--split-ratio', type = float, default = 0.9)
     parser.add_argument('--batch-size', type = int, default = 1024)

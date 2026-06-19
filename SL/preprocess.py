@@ -1,37 +1,17 @@
 from feature import FeatureAgent
-import argparse
 import json
-import os
-import shutil
-import tempfile
 from pathlib import Path
 
 import numpy as np
 
 
-# Toggle here when you want to switch between local disk and OBS.
-USE_OBS_IO = False
-
-# Change this to your actual OBS bucket name.
-BUCKET_NAME = 'mahjong-data'
-OBS_DATA_PREFIX = f'obs://{BUCKET_NAME}/SL/data'
-
-# Toggle here when you want to switch between one-match-per-file and sharded output.
 USE_SHARDS = False
 
 # Tune this if you want bigger or smaller shard files.
 SHARD_SAMPLE_LIMIT = 90000
 
-# Local mode:
-# INPUT_FILE = 'data/data.txt'
-# OUTPUT_DIR = 'data'
-
-# OBS mode:
-# INPUT_FILE = f'{OBS_DATA_PREFIX}/data.txt'
-# OUTPUT_DIR = OBS_DATA_PREFIX
-
-INPUT_FILE = f'{OBS_DATA_PREFIX}/data.txt' if USE_OBS_IO else 'data/data.txt'
-OUTPUT_DIR = OBS_DATA_PREFIX if USE_OBS_IO else 'data'
+INPUT_FILE = 'data/data.txt'
+OUTPUT_DIR = 'data'
 
 obs = [[] for _ in range(4)]
 actions = [[] for _ in range(4)]
@@ -50,62 +30,18 @@ if USE_SHARDS:
     shard_manifest = []
 
 
-def _is_obs_path(path):
-    return str(path).startswith('obs://')
-
-
-def _load_mox():
-    try:
-        import moxing as mox  # type: ignore
-    except Exception:
-        return None
-    return mox
-
-
 def _resolve_local_path(path):
     path = Path(path)
     return path if path.is_absolute() else base_dir / path
 
 
 def _save_npz(output_dir, name, **payload):
-    if _is_obs_path(output_dir):
-        mox = _load_mox()
-        if mox is None:
-            raise RuntimeError('OBS output requires moxing in ModelArts.')
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix = '.npz', delete = False) as tmp:
-                tmp_path = tmp.name
-            np.savez(tmp_path, **payload)
-            dest = f"{str(output_dir).rstrip('/')}/{name}.npz"
-            mox.file.copy(tmp_path, dest)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        return
-
     output_path = _resolve_local_path(output_dir)
     output_path.mkdir(parents = True, exist_ok = True)
     np.savez(output_path / f'{name}.npz', **payload)
 
 
 def _save_json(output_dir, name, payload):
-    if _is_obs_path(output_dir):
-        mox = _load_mox()
-        if mox is None:
-            raise RuntimeError('OBS output requires moxing in ModelArts.')
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(mode = 'w', suffix = '.json', encoding = 'utf-8', delete = False) as tmp:
-                tmp_path = tmp.name
-                json.dump(payload, tmp)
-            dest = f"{str(output_dir).rstrip('/')}/{name}.json"
-            mox.file.copy(tmp_path, dest)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        return
-
     output_path = _resolve_local_path(output_dir)
     output_path.mkdir(parents = True, exist_ok = True)
     with open(output_path / f'{name}.json', 'w', encoding = 'utf-8') as f:
@@ -113,16 +49,7 @@ def _save_json(output_dir, name, payload):
 
 
 def _open_input_file(input_file):
-    if _is_obs_path(input_file):
-        mox = _load_mox()
-        if mox is None:
-            raise RuntimeError('OBS input requires moxing in ModelArts.')
-        tmp_dir = tempfile.mkdtemp(prefix = 'sl_preprocess_')
-        local_path = os.path.join(tmp_dir, Path(str(input_file)).name or 'data.txt')
-        mox.file.copy(str(input_file), local_path)
-        return open(local_path, encoding = 'UTF-8'), tmp_dir
-
-    return open(_resolve_local_path(input_file), encoding = 'UTF-8'), None
+    return open(_resolve_local_path(input_file), encoding = 'UTF-8')
 
 
 def filterData():
@@ -218,7 +145,7 @@ def _append_match_to_shard(match_samples, payload):
         _flush_shard()
 
 
-f, _tmp_dir = _open_input_file(INPUT_FILE)
+f = _open_input_file(INPUT_FILE)
 try:
     line = f.readline()
     while line:
@@ -329,8 +256,6 @@ try:
         line = f.readline()
 finally:
     f.close()
-    if _tmp_dir is not None:
-        shutil.rmtree(_tmp_dir, ignore_errors = True)
 
 if USE_SHARDS:
     _flush_shard()
