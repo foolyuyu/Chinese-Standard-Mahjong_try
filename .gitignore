@@ -153,6 +153,8 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv*/
+.venv-sl/
 env/
 venv/
 ENV/
@@ -206,6 +208,8 @@ SL/__pycache__/
 RL/__pycache__/
 SL/data/data.txt
 SL/model/checkpoint/
+SL/model/
+model/
 SL/*.zip
 SL/*.pptx
 #   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore

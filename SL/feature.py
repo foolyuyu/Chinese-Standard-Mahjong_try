@@ -1,5 +1,6 @@
 from agent import MahjongGBAgent
 from collections import defaultdict
+from functools import lru_cache
 import numpy as np
 
 try:
@@ -12,17 +13,23 @@ except:
 class FeatureAgent(MahjongGBAgent):
 
     '''
-    observation: 148*4*9 + global(10)
+    suit_observation: 148*3*9 + honor_observation: 148*7 + global(23)
         hand4 + each player(meld7 + discard28)*4 + remaining4
         meld7 = chi1/2/3/4 + peng + exposed_gang + concealed_gang
-    global: 10
+    global: 23
         seat wind one-hot 4 + prevalent wind one-hot 4 + isAboutKong + min_remaining/21.0
+        + route progress features:
+          normal shanten/effective, seven pairs shanten/effective,
+          knitted distance/effective, knitted straight distance/effective
+        + low-risk fan-potential shape statistics:
+          max suit ratio, terminal/honor ratio, pair count,
+          triplet-like count, chow candidate count
     action_mask: 235
         pass1+hu1+discard34+chi63(3*7*3)+peng34+gang34+angang34+bugang34
     '''
 
     OBS_SIZE = 148
-    GLOBAL_SIZE = 10
+    GLOBAL_SIZE = 23
     ACT_SIZE = 235
     PLAYER_COUNT = 4
     TILE_COUNT = 36
@@ -353,11 +360,18 @@ class FeatureAgent(MahjongGBAgent):
         mask = np.zeros(self.ACT_SIZE)
         for a in self.valid:
             mask[a] = 1
+        suit_obs, honor_obs = self._split_tile_embedding()
         return {
-            'observation': self.obs.reshape((self.OBS_SIZE, 4, 9)).copy(),
+            'suit_observation': suit_obs.copy(),
+            'honor_observation': honor_obs.copy(),
             'global': self.global_obs.copy(),
             'action_mask': mask
         }
+
+    def _split_tile_embedding(self):
+        suit_obs = self.obs[:, :27].reshape((self.OBS_SIZE, 3, 9))
+        honor_obs = self.obs[:, 27:34]
+        return suit_obs, honor_obs
 
     def _global_embedding_update(self):
         self.global_obs[:] = 0
@@ -365,6 +379,269 @@ class FeatureAgent(MahjongGBAgent):
         self.global_obs[4 + self.prevalentWind] = 1
         self.global_obs[8] = 1.0 if self.isAboutKong else 0.0
         self.global_obs[9] = min(self.tileWall) / 21.0
+        if hasattr(self, 'hand'):
+            features = self._hand_progress_features()
+            self.global_obs[10] = self._normalize_shanten(features['normal_shanten'])
+            self.global_obs[11] = self._normalize_effective(features['normal_effective'])
+            self.global_obs[12] = self._normalize_shanten(features['seven_pairs_shanten'])
+            self.global_obs[13] = self._normalize_effective(features['seven_pairs_effective'])
+            self.global_obs[14] = self._normalize_distance(features['knitted_distance'], 14)
+            self.global_obs[15] = self._normalize_effective(features['knitted_effective'])
+            self.global_obs[16] = self._normalize_distance(features['knitted_straight_distance'], 9)
+            self.global_obs[17] = self._normalize_effective(features['knitted_straight_effective'])
+            shape_stats = self._fan_potential_shape_stats()
+            self.global_obs[18] = shape_stats['max_suit_ratio']
+            self.global_obs[19] = shape_stats['terminal_honor_ratio']
+            self.global_obs[20] = shape_stats['pair_count']
+            self.global_obs[21] = shape_stats['triplet_like_count']
+            self.global_obs[22] = shape_stats['chow_candidate_count']
+
+    def _hand_progress_features(self):
+        counts = self._tile_counts(self.hand)
+        open_melds = len(self.packs[0])
+        normal_distance = lambda x: self._normal_shanten(x, open_melds)
+        seven_distance = lambda x: self._seven_pairs_route_distance(x, open_melds)
+        knitted_distance = lambda x: self._knitted_route_distance(x, open_melds)
+        knitted_straight_distance = self._knitted_straight_distance
+        return {
+            'normal_shanten': normal_distance(tuple(counts)),
+            'normal_effective': self._route_effective_tile_count(counts, normal_distance),
+            'seven_pairs_shanten': seven_distance(tuple(counts)),
+            'seven_pairs_effective': self._route_effective_tile_count(counts, seven_distance),
+            'knitted_distance': knitted_distance(tuple(counts)),
+            'knitted_effective': self._route_effective_tile_count(counts, knitted_distance),
+            'knitted_straight_distance': knitted_straight_distance(tuple(counts)),
+            'knitted_straight_effective': self._route_effective_tile_count(counts, knitted_straight_distance),
+        }
+
+    @staticmethod
+    def _normalize_shanten(shanten):
+        return (min(max(shanten, -1), 6) + 1) / 7.0
+
+    @staticmethod
+    def _normalize_distance(distance, max_distance):
+        return min(max(distance, 0), max_distance) / float(max_distance)
+
+    @staticmethod
+    def _normalize_effective(effective_tiles):
+        return min(effective_tiles, 64) / 64.0
+
+    def _tile_counts(self, tiles):
+        counts = [0] * len(self.TILE_LIST)
+        for tile in tiles:
+            if tile in self.OFFSET_TILE:
+                counts[self.OFFSET_TILE[tile]] += 1
+        return counts
+
+    def _fan_potential_shape_stats(self):
+        hand_counts = self._tile_counts(self.hand)
+        counts = self._tile_counts(self.hand + self._own_pack_tiles())
+        total_tiles = max(1, sum(counts))
+        suit_counts = [sum(counts[i * 9 : (i + 1) * 9]) for i in range(3)]
+        terminal_honor_count = sum(counts[idx] for idx in self._terminal_honor_indices())
+        pair_count = sum(1 for count in hand_counts if count >= 2)
+        triplet_like_count = sum(1 for count in counts if count >= 3)
+        chow_candidate_count = self._own_chow_count()
+        for suit in range(3):
+            base = suit * 9
+            for start in range(7):
+                if hand_counts[base + start] and hand_counts[base + start + 1] and hand_counts[base + start + 2]:
+                    chow_candidate_count += 1
+        return {
+            'max_suit_ratio': max(suit_counts) / total_tiles,
+            'terminal_honor_ratio': terminal_honor_count / total_tiles,
+            'pair_count': min(pair_count, 7) / 7.0,
+            'triplet_like_count': min(triplet_like_count, 4) / 4.0,
+            'chow_candidate_count': min(chow_candidate_count, 21) / 21.0,
+        }
+
+    def _own_pack_tiles(self):
+        tiles = []
+        for packType, tile, offer in self.packs[0]:
+            if tile not in self.OFFSET_TILE:
+                continue
+            if packType == 'CHI':
+                if tile[0] not in 'WTB':
+                    continue
+                num = int(tile[1])
+                for delta in [-1, 0, 1]:
+                    seq_tile = tile[0] + str(num + delta)
+                    if seq_tile in self.OFFSET_TILE:
+                        tiles.append(seq_tile)
+            elif packType == 'PENG':
+                tiles.extend([tile] * 3)
+            elif packType == 'GANG':
+                tiles.extend([tile] * 4)
+        return tiles
+
+    def _own_chow_count(self):
+        return sum(1 for packType, tile, offer in self.packs[0] if packType == 'CHI')
+
+    @staticmethod
+    @lru_cache(maxsize = 1)
+    def _terminal_honor_indices():
+        return tuple([0, 8, 9, 17, 18, 26, *range(27, 34)])
+
+    def _route_effective_tile_count(self, counts, distance_fn):
+        hand_size = sum(counts)
+        if hand_size % 3 == 2:
+            best_effective = 0
+            for idx, count in enumerate(counts):
+                if count == 0:
+                    continue
+                counts[idx] -= 1
+                best_effective = max(best_effective, self._route_effective_tile_count_after_discard(counts, distance_fn))
+                counts[idx] += 1
+            return best_effective
+        return self._route_effective_tile_count_after_discard(counts, distance_fn)
+
+    def _route_effective_tile_count_after_discard(self, counts, distance_fn):
+        base_distance = distance_fn(tuple(counts))
+        effective_tiles = 0
+        for idx, tile in enumerate(self.TILE_LIST):
+            remaining = 4 - self.shownTiles[tile] - counts[idx]
+            if remaining <= 0:
+                continue
+            counts[idx] += 1
+            next_distance = distance_fn(tuple(counts))
+            counts[idx] -= 1
+            if next_distance < base_distance:
+                effective_tiles += min(4, remaining)
+        return effective_tiles
+
+    @staticmethod
+    def _seven_pairs_route_distance(counts_tuple, open_melds):
+        if open_melds > 0:
+            return 7
+        return FeatureAgent._seven_pairs_shanten(counts_tuple)
+
+    @staticmethod
+    def _knitted_route_distance(counts_tuple, open_melds):
+        if open_melds > 0:
+            return 14
+        present = {idx for idx, count in enumerate(counts_tuple) if count > 0}
+        return min(max(0, 14 - len(present & candidate)) for candidate in FeatureAgent._knitted_candidates())
+
+    @staticmethod
+    def _knitted_straight_distance(counts_tuple):
+        present = {idx for idx, count in enumerate(counts_tuple) if count > 0}
+        return min(9 - len(present & candidate) for candidate in FeatureAgent._knitted_straight_candidates())
+
+    @staticmethod
+    @lru_cache(maxsize = 1)
+    def _knitted_candidates():
+        honor_indices = set(range(27, 34))
+        return tuple(honor_indices | candidate for candidate in FeatureAgent._knitted_straight_candidates())
+
+    @staticmethod
+    @lru_cache(maxsize = 1)
+    def _knitted_straight_candidates():
+        from itertools import permutations
+        rank_groups = ((0, 3, 6), (1, 4, 7), (2, 5, 8))
+        candidates = []
+        for suit_perm in permutations(range(3)):
+            indices = set()
+            for group, suit in zip(rank_groups, suit_perm):
+                base = suit * 9
+                indices.update(base + rank for rank in group)
+            candidates.append(frozenset(indices))
+        return tuple(candidates)
+
+    @staticmethod
+    @lru_cache(maxsize = 200000)
+    def _seven_pairs_shanten(counts_tuple):
+        pairs = sum(1 for count in counts_tuple if count >= 2)
+        unique = sum(1 for count in counts_tuple if count > 0)
+        return 6 - pairs + max(0, 7 - unique)
+
+    @staticmethod
+    @lru_cache(maxsize = 200000)
+    def _normal_shanten(counts_tuple, open_melds):
+        from itertools import product
+        block_states = [
+            FeatureAgent._block_states(counts_tuple[0:9], True),
+            FeatureAgent._block_states(counts_tuple[9:18], True),
+            FeatureAgent._block_states(counts_tuple[18:27], True),
+            FeatureAgent._block_states(counts_tuple[27:34], False),
+        ]
+        best = 8
+        for states in product(*block_states):
+            melds = sum(state[0] for state in states)
+            taatsu = sum(state[1] for state in states)
+            pair = min(1, sum(state[2] for state in states))
+            max_taatsu = min(taatsu, max(0, 4 - open_melds - melds))
+            best = min(best, 8 - 2 * (open_melds + melds) - max_taatsu - pair)
+        return best
+
+    @staticmethod
+    @lru_cache(maxsize = 200000)
+    def _block_states(counts_tuple, allow_sequence):
+        counts = list(counts_tuple)
+        states = set()
+
+        def dfs(melds, taatsu, pair):
+            idx = 0
+            while idx < len(counts) and counts[idx] == 0:
+                idx += 1
+            if idx == len(counts):
+                states.add((melds, taatsu, pair))
+                return
+
+            if counts[idx] >= 3:
+                counts[idx] -= 3
+                dfs(melds + 1, taatsu, pair)
+                counts[idx] += 3
+
+            if allow_sequence and idx <= 6 and counts[idx + 1] > 0 and counts[idx + 2] > 0:
+                counts[idx] -= 1
+                counts[idx + 1] -= 1
+                counts[idx + 2] -= 1
+                dfs(melds + 1, taatsu, pair)
+                counts[idx] += 1
+                counts[idx + 1] += 1
+                counts[idx + 2] += 1
+
+            if counts[idx] >= 2:
+                counts[idx] -= 2
+                dfs(melds, taatsu, 1)
+                dfs(melds, taatsu + 1, pair)
+                counts[idx] += 2
+
+            if allow_sequence and idx <= 7 and counts[idx + 1] > 0:
+                counts[idx] -= 1
+                counts[idx + 1] -= 1
+                dfs(melds, taatsu + 1, pair)
+                counts[idx] += 1
+                counts[idx + 1] += 1
+
+            if allow_sequence and idx <= 6 and counts[idx + 2] > 0:
+                counts[idx] -= 1
+                counts[idx + 2] -= 1
+                dfs(melds, taatsu + 1, pair)
+                counts[idx] += 1
+                counts[idx + 2] += 1
+
+            counts[idx] -= 1
+            dfs(melds, taatsu, pair)
+            counts[idx] += 1
+
+        dfs(0, 0, 0)
+        return FeatureAgent._prune_states(states)
+
+    @staticmethod
+    def _prune_states(states):
+        pruned = []
+        for state in states:
+            dominated = False
+            for other in states:
+                if other == state:
+                    continue
+                if other[0] >= state[0] and other[1] >= state[1] and other[2] >= state[2]:
+                    dominated = True
+                    break
+            if not dominated:
+                pruned.append(state)
+        return tuple(pruned)
 
     def _hand_embedding_update(self):
         self.obs[self.OFFSET_OBS['HAND'] : self.OFFSET_OBS['HAND'] + self.HAND_SIZE] = 0

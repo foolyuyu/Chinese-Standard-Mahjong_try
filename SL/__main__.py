@@ -5,7 +5,7 @@ import sys
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 
-DATA_DIR = '/data/41.pkl'
+DATA_DIR = '/data/8.pkl'
 DEBUG = False
 _MODEL = None
 FeatureAgent = None
@@ -67,10 +67,10 @@ def obs2response(obs):
     import torch
     glob = obs.get('global')
     if glob is None:
-        glob = np.zeros(10, dtype = np.float32)
+        glob = np.zeros(model.GLOBAL_SIZE, dtype = np.float32)
     with torch.no_grad():
         debug('forward begin')
-        logits = model({'is_training': False, 'obs': {'observation': torch.from_numpy(np.expand_dims(obs['observation'], 0)), 'global': torch.from_numpy(np.expand_dims(glob, 0)), 'action_mask': torch.from_numpy(np.expand_dims(obs['action_mask'], 0))}})
+        logits = model({'is_training': False, 'obs': {'suit_observation': torch.from_numpy(np.expand_dims(obs['suit_observation'], 0)), 'honor_observation': torch.from_numpy(np.expand_dims(obs['honor_observation'], 0)), 'global': torch.from_numpy(np.expand_dims(glob, 0)), 'action_mask': torch.from_numpy(np.expand_dims(obs['action_mask'], 0))}})
         debug('forward ok')
         action = logits.detach().numpy().flatten().argmax()
     response = agent.action2response(action)

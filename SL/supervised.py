@@ -88,16 +88,17 @@ def _load_resume_checkpoint(model, resume_path, device):
 
 def _to_device(batch, device):
     non_blocking = device.type in ['cuda', 'npu']
-    obs = torch.from_numpy(batch['obs']).to(device, non_blocking = non_blocking)
+    suit_obs = torch.from_numpy(batch['suit_obs']).to(device, non_blocking = non_blocking)
+    honor_obs = torch.from_numpy(batch['honor_obs']).to(device, non_blocking = non_blocking)
     glob = torch.from_numpy(batch['glob']).to(device, non_blocking = non_blocking)
     mask = torch.from_numpy(batch['mask']).to(device, non_blocking = non_blocking)
     act = torch.from_numpy(batch['act']).long().to(device, non_blocking = non_blocking)
-    return obs, glob, mask, act
+    return suit_obs, honor_obs, glob, mask, act
 
 
 def _train_batch(model, optimizer, batch, device, grad_clip):
-    obs, glob, mask, act = _to_device(batch, device)
-    input_dict = {'is_training': True, 'obs': {'observation': obs, 'global': glob, 'action_mask': mask}}
+    suit_obs, honor_obs, glob, mask, act = _to_device(batch, device)
+    input_dict = {'is_training': True, 'obs': {'suit_observation': suit_obs, 'honor_observation': honor_obs, 'global': glob, 'action_mask': mask}}
     logits = model(input_dict)
     loss = F.cross_entropy(logits, act)
     optimizer.zero_grad()
@@ -133,26 +134,45 @@ def _load_manifest(data_dir):
     raise ValueError('Unsupported count.json format in %s' % data_dir)
 
 
-def _pad_obs_array(obs):
+def _split_legacy_obs(obs):
+    flat = obs.reshape(obs.shape[0], obs.shape[1], 36)
+    return flat[:, :, :27].reshape((obs.shape[0], obs.shape[1], 3, 9)), flat[:, :, 27:34]
+
+
+def _pad_suit_obs_array(suit_obs):
     channels = CNNModel.OBS_CHANNELS
-    if obs.shape[1] == channels:
-        return obs
-    if obs.shape[1] > channels:
-        return obs[:, :channels]
-    padded = np.zeros((obs.shape[0], channels, obs.shape[2], obs.shape[3]), dtype = obs.dtype)
-    padded[:, :obs.shape[1]] = obs
-    return padded
+    if suit_obs.shape[1] < channels:
+        padded = np.zeros((suit_obs.shape[0], channels, suit_obs.shape[2], suit_obs.shape[3]), dtype = suit_obs.dtype)
+        padded[:, :suit_obs.shape[1]] = suit_obs
+        suit_obs = padded
+    return suit_obs[:, :channels, :3, :9]
+
+
+def _pad_honor_obs_array(honor_obs):
+    channels = CNNModel.OBS_CHANNELS
+    if honor_obs.shape[1] < channels:
+        padded = np.zeros((honor_obs.shape[0], channels, honor_obs.shape[2]), dtype = honor_obs.dtype)
+        padded[:, :honor_obs.shape[1]] = honor_obs
+        honor_obs = padded
+    return honor_obs[:, :channels, :7]
 
 
 def _load_chunk(data_dir, chunk):
     with np.load(data_dir / chunk['file']) as d:
-        obs = _pad_obs_array(d['obs'])
+        if 'suit_obs' in d and 'honor_obs' in d:
+            suit_obs = d['suit_obs']
+            honor_obs = d['honor_obs']
+        else:
+            suit_obs, honor_obs = _split_legacy_obs(d['obs'])
+        suit_obs = _pad_suit_obs_array(suit_obs)
+        honor_obs = _pad_honor_obs_array(honor_obs)
         if 'glob' in d:
             glob = d['glob']
         else:
-            glob = np.zeros((obs.shape[0], CNNModel.GLOBAL_SIZE), dtype = np.float32)
+            glob = np.zeros((suit_obs.shape[0], CNNModel.GLOBAL_SIZE), dtype = np.float32)
         return {
-            'obs': obs,
+            'suit_obs': suit_obs,
+            'honor_obs': honor_obs,
             'glob': glob.astype(np.float32, copy = False),
             'mask': d['mask'],
             'act': d['act'],
@@ -261,8 +281,8 @@ def _run_local_training(args, device, base_dir):
         with torch.no_grad():
             for _, chunk_payload in _iter_loaded_chunks(valid_data_dir, valid_chunks, args.prefetch_chunks):
                 for d in _iter_eval_batches(chunk_payload, args.batch_size):
-                    obs, glob, mask, act = _to_device(d, device)
-                    input_dict = {'is_training': False, 'obs': {'observation': obs, 'global': glob, 'action_mask': mask}}
+                    suit_obs, honor_obs, glob, mask, act = _to_device(d, device)
+                    input_dict = {'is_training': False, 'obs': {'suit_observation': suit_obs, 'honor_observation': honor_obs, 'global': glob, 'action_mask': mask}}
                     logits = model(input_dict)
                     pred = logits.argmax(dim = 1)
                     correct += torch.eq(pred, act).sum().item()
