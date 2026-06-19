@@ -10,16 +10,14 @@ import numpy as np
 
 
 # Toggle here when you want to switch between local disk and OBS.
-# USE_OBS_IO = False
-USE_OBS_IO = True
+USE_OBS_IO = False
 
 # Change this to your actual OBS bucket name.
 BUCKET_NAME = 'mahjong-data'
 OBS_DATA_PREFIX = f'obs://{BUCKET_NAME}/SL/data'
 
 # Toggle here when you want to switch between one-match-per-file and sharded output.
-# USE_SHARDS = False
-USE_SHARDS = True
+USE_SHARDS = False
 
 # Tune this if you want bigger or smaller shard files.
 SHARD_SAMPLE_LIMIT = 90000

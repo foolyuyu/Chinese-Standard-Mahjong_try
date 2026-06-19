@@ -330,8 +330,7 @@ def _run_legacy_training(args, manifest, device, base_dir):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Supervised training for MahjongGB')
     # Toggle here to switch default training data source.
-    # USE_OBS_IO = False
-    USE_OBS_IO = True
+    USE_OBS_IO = False
     # Change this to your actual OBS bucket name.
     BUCKET_NAME = 'mahjong-data'
     OBS_DATA_PREFIX = f'obs://{BUCKET_NAME}/SL/data'
