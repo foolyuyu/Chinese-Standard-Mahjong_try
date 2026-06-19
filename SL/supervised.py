@@ -1,14 +1,13 @@
 from pathlib import Path
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import csv
-import random
+import json
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 
-from dataset import MahjongGBDataset, load_manifest, load_shard_arrays
 from model import CNNModel
 
 
@@ -79,15 +78,6 @@ def _save_best_checkpoint(model, logdir):
     _save_cpu_checkpoint(model, logdir / 'best.pkl')
 
 
-def _fixed_split_indices(n, split_ratio, seed):
-    indices = np.arange(n)
-    rng = np.random.default_rng(seed = seed)
-    rng.shuffle(indices)
-    split_point = int(n * split_ratio)
-    split_point = min(max(split_point, 1), n) if n > 1 else n
-    return indices[:split_point], indices[split_point:]
-
-
 def _load_resume_checkpoint(model, resume_path, device):
     if not resume_path:
         return
@@ -97,172 +87,149 @@ def _load_resume_checkpoint(model, resume_path, device):
 
 
 def _to_device(batch, device):
-    obs = torch.from_numpy(batch['obs']).to(device)
-    glob = torch.from_numpy(batch['glob']).to(device)
-    mask = torch.from_numpy(batch['mask']).to(device)
-    act = torch.from_numpy(batch['act']).long().to(device)
+    non_blocking = device.type in ['cuda', 'npu']
+    obs = torch.from_numpy(batch['obs']).to(device, non_blocking = non_blocking)
+    glob = torch.from_numpy(batch['glob']).to(device, non_blocking = non_blocking)
+    mask = torch.from_numpy(batch['mask']).to(device, non_blocking = non_blocking)
+    act = torch.from_numpy(batch['act']).long().to(device, non_blocking = non_blocking)
     return obs, glob, mask, act
 
 
-def _train_on_indices(model, optimizer, arrays, indices, device, batch_size, grad_clip, epoch, shard_name):
-    model.train(True)
-    total_loss = 0.0
-    total_count = 0
-    if len(indices) == 0:
-        return total_loss, total_count
-    for step in range(0, len(indices), batch_size):
-        batch_idx = indices[step: step + batch_size]
-        batch = {
-            'obs': arrays['obs'][batch_idx],
-            'glob': arrays['glob'][batch_idx],
-            'mask': arrays['mask'][batch_idx],
-            'act': arrays['act'][batch_idx],
+def _train_batch(model, optimizer, batch, device, grad_clip):
+    obs, glob, mask, act = _to_device(batch, device)
+    input_dict = {'is_training': True, 'obs': {'observation': obs, 'global': glob, 'action_mask': mask}}
+    logits = model(input_dict)
+    loss = F.cross_entropy(logits, act)
+    optimizer.zero_grad()
+    loss.backward()
+    if grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+    return loss.item(), len(batch['act'])
+
+
+def _resolve_data_dir(data_dir, base_dir):
+    path = Path(data_dir)
+    return path if path.is_absolute() else base_dir / path
+
+
+def _load_manifest(data_dir):
+    with open(data_dir / 'count.json', encoding = 'utf-8') as f:
+        manifest = json.load(f)
+    if isinstance(manifest, dict):
+        chunks = manifest.get('chunks', [])
+        return {
+            'schema': manifest.get('schema', 'local-chunk-v1'),
+            'total_samples': int(manifest.get('total_samples', sum(int(x['samples']) for x in chunks))),
+            'chunks': chunks,
         }
-        obs, glob, mask, act = _to_device(batch, device)
-        input_dict = {'is_training': True, 'obs': {'observation': obs, 'global': glob, 'action_mask': mask}}
-        logits = model(input_dict)
-        loss = F.cross_entropy(logits, act)
-        optimizer.zero_grad()
-        loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
-        total_loss += loss.item() * len(batch_idx)
-        total_count += len(batch_idx)
-        if step % max(batch_size * 8, batch_size) == 0:
-            print('  train', shard_name, '%d/%d' % (step, len(indices)), 'loss', loss.item())
-    return total_loss, total_count
-
-
-@torch.no_grad()
-def _eval_on_indices(model, arrays, indices, device, batch_size, shard_name):
-    model.train(False)
-    total_correct = 0
-    total_count = 0
-    for step in range(0, len(indices), batch_size):
-        batch_idx = indices[step: step + batch_size]
-        batch = {
-            'obs': arrays['obs'][batch_idx],
-            'glob': arrays['glob'][batch_idx],
-            'mask': arrays['mask'][batch_idx],
-            'act': arrays['act'][batch_idx],
+    if isinstance(manifest, list):
+        chunks = [{'file': '%d.npz' % i, 'samples': int(samples)} for i, samples in enumerate(manifest)]
+        return {
+            'schema': 'legacy-match-v1',
+            'total_samples': int(sum(manifest)),
+            'chunks': chunks,
         }
-        obs, glob, mask, act = _to_device(batch, device)
-        input_dict = {'is_training': False, 'obs': {'observation': obs, 'global': glob, 'action_mask': mask}}
-        logits = model(input_dict)
-        pred = logits.argmax(dim = 1)
-        total_correct += torch.eq(pred, act).sum().item()
-        total_count += len(batch_idx)
-    if total_count:
-        print('  val', shard_name, 'acc', total_correct / total_count)
-    return total_correct, total_count
+    raise ValueError('Unsupported count.json format in %s' % data_dir)
 
 
-def _run_sharded_training(args, manifest, device, base_dir):
-    _maybe_set_npu(device)
-    data_dir = args.data_dir
-    logdir = Path(args.logdir) if args.logdir else base_dir / 'model'
-    (logdir / 'checkpoint').mkdir(parents = True, exist_ok = True)
-    metrics_path = _resolve_metrics_path(args, base_dir)
+def _pad_obs_array(obs):
+    channels = CNNModel.OBS_CHANNELS
+    if obs.shape[1] == channels:
+        return obs
+    if obs.shape[1] > channels:
+        return obs[:, :channels]
+    padded = np.zeros((obs.shape[0], channels, obs.shape[2], obs.shape[3]), dtype = obs.dtype)
+    padded[:, :obs.shape[1]] = obs
+    return padded
 
-    model = CNNModel().to(device)
-    _load_resume_checkpoint(model, args.resume, device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr = args.lr, weight_decay = args.weight_decay)
-    shards = list(manifest.get('shards', []))
-    if not shards:
-        raise RuntimeError('Shard manifest is empty.')
 
-    best_acc = float('-inf')
-    best_epoch = None
-    epochs_without_improvement = 0
-
-    for e in range(args.start_epoch, args.start_epoch + args.epochs):
-        print('Epoch', e)
-        _save_cpu_checkpoint(model, logdir / 'checkpoint' / ('%d.pkl' % e))
-
-        epoch_rng = np.random.default_rng(seed = e)
-        shard_order = list(range(len(shards)))
-        epoch_rng.shuffle(shard_order)
-
-        train_loss_sum = 0.0
-        train_count = 0
-        val_correct = 0
-        val_count = 0
-
-        for shard_idx in shard_order:
-            shard = shards[shard_idx]
-            arrays = load_shard_arrays(data_dir, shard['file'])
-            n = len(arrays['act'])
-            if n == 0:
-                continue
-
-            train_idx, val_idx = _fixed_split_indices(n, args.split_ratio, args.split_seed + shard_idx)
-            train_idx = train_idx.copy()
-            epoch_rng.shuffle(train_idx)
-
-            if len(train_idx):
-                loss_sum, count = _train_on_indices(model, optimizer, arrays, train_idx, device, args.batch_size, args.grad_clip, e, shard['file'])
-                train_loss_sum += loss_sum
-                train_count += count
-
-            if len(val_idx):
-                correct, count = _eval_on_indices(model, arrays, val_idx, device, args.batch_size, shard['file'])
-                val_correct += correct
-                val_count += count
-
-            del arrays
-
-        avg_loss = train_loss_sum / train_count if train_count else 0.0
-        avg_acc = val_correct / val_count if val_count else 0.0
-        print('Epoch', e + 1, 'train_loss:', avg_loss, 'validate_acc:', avg_acc)
-        _append_metrics_row(metrics_path, {
-            'epoch': e + 1,
-            'mode': 'sharded',
-            'train_loss': avg_loss,
-            'validate_acc': avg_acc,
-            'train_samples': train_count,
-            'validate_samples': val_count,
-        })
-
-        if avg_acc > best_acc:
-            best_acc = avg_acc
-            best_epoch = e + 1
-            epochs_without_improvement = 0
-            _save_best_checkpoint(model, logdir)
-            print('New best validation accuracy:', best_acc, 'at epoch', best_epoch)
+def _load_chunk(data_dir, chunk):
+    with np.load(data_dir / chunk['file']) as d:
+        obs = _pad_obs_array(d['obs'])
+        if 'glob' in d:
+            glob = d['glob']
         else:
-            epochs_without_improvement += 1
-            print('No improvement for', epochs_without_improvement, 'epoch(s). Best epoch:', best_epoch, 'best acc:', best_acc)
+            glob = np.zeros((obs.shape[0], CNNModel.GLOBAL_SIZE), dtype = np.float32)
+        return {
+            'obs': obs,
+            'glob': glob.astype(np.float32, copy = False),
+            'mask': d['mask'],
+            'act': d['act'],
+        }
 
-        if args.patience >= 0 and epochs_without_improvement >= args.patience:
-            print('Early stopping triggered at epoch', e + 1, 'best epoch:', best_epoch, 'best acc:', best_acc)
-            break
+
+def _iter_loaded_chunks(data_dir, chunks, prefetch_chunks):
+    if prefetch_chunks <= 0:
+        for chunk in chunks:
+            yield chunk, _load_chunk(data_dir, chunk)
+        return
+
+    with ThreadPoolExecutor(max_workers = prefetch_chunks) as executor:
+        chunk_iter = iter(chunks)
+        pending = []
+        for _ in range(prefetch_chunks):
+            try:
+                chunk = next(chunk_iter)
+            except StopIteration:
+                break
+            pending.append((chunk, executor.submit(_load_chunk, data_dir, chunk)))
+        while pending:
+            chunk, future = pending.pop(0)
+            try:
+                next_chunk = next(chunk_iter)
+                pending.append((next_chunk, executor.submit(_load_chunk, data_dir, next_chunk)))
+            except StopIteration:
+                pass
+            yield chunk, future.result()
 
 
-def _run_legacy_training(args, manifest, device, base_dir):
-    # Legacy one-match-per-file mode kept for local fallback.
+def _count_batches(chunks, batch_size):
+    return sum((int(chunk['samples']) + batch_size - 1) // batch_size for chunk in chunks)
+
+
+def _take_indexed_batch(payload, indices):
+    return {key: value[indices] for key, value in payload.items()}
+
+
+def _take_sliced_batch(payload, start, end):
+    return {key: value[start:end] for key, value in payload.items()}
+
+
+def _iter_train_batches(payload, batch_size, rng):
+    sample_count = len(payload['act'])
+    indices = np.arange(sample_count)
+    rng.shuffle(indices)
+    for start in range(0, sample_count, batch_size):
+        yield _take_indexed_batch(payload, indices[start : start + batch_size])
+
+
+def _iter_eval_batches(payload, batch_size):
+    sample_count = len(payload['act'])
+    for start in range(0, sample_count, batch_size):
+        yield _take_sliced_batch(payload, start, start + batch_size)
+
+
+def _run_local_training(args, device, base_dir):
+    _maybe_set_npu(device)
     logdir = Path(args.logdir) if args.logdir else base_dir / 'model'
     (logdir / 'checkpoint').mkdir(parents = True, exist_ok = True)
     metrics_path = _resolve_metrics_path(args, base_dir)
 
-    trainDataset = MahjongGBDataset(0, args.split_ratio, True, data_dir = args.data_dir)
-    validateDataset = MahjongGBDataset(args.split_ratio, 1, False, data_dir = args.data_dir)
-    loader = DataLoader(
-        dataset = trainDataset,
-        batch_size = args.batch_size,
-        shuffle = True,
-        num_workers = args.num_workers,
-        pin_memory = device.type == 'cuda'
-    )
-    vloader = DataLoader(
-        dataset = validateDataset,
-        batch_size = args.batch_size,
-        shuffle = False,
-        num_workers = args.num_workers,
-        pin_memory = device.type == 'cuda'
-    )
+    train_data_dir = _resolve_data_dir(args.train_data_dir, base_dir)
+    valid_data_dir = _resolve_data_dir(args.valid_data_dir, base_dir)
+    train_manifest = _load_manifest(train_data_dir)
+    valid_manifest = _load_manifest(valid_data_dir)
+    train_chunks = list(train_manifest['chunks'])
+    valid_chunks = list(valid_manifest['chunks'])
+    train_batches = _count_batches(train_chunks, args.batch_size)
+    rng = np.random.default_rng(seed = args.seed)
 
     print('Using device:', device)
+    print('Train samples:', train_manifest['total_samples'], 'chunks:', len(train_chunks), 'batches:', train_batches)
+    print('Valid samples:', valid_manifest['total_samples'], 'chunks:', len(valid_chunks))
+    if train_manifest['schema'] == 'legacy-match-v1':
+        print('Warning: training data uses legacy per-match npz files. Re-run preprocess.py for faster chunked loading.')
     model = CNNModel().to(device)
     _load_resume_checkpoint(model, args.resume, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr = args.lr, weight_decay = args.weight_decay)
@@ -276,36 +243,37 @@ def _run_legacy_training(args, manifest, device, base_dir):
         _save_cpu_checkpoint(model, logdir / 'checkpoint' / ('%d.pkl' % e))
         train_loss_sum = 0.0
         train_count = 0
-        for i, d in enumerate(loader):
-            input_dict = {'is_training': True, 'obs': {'observation': d[0].to(device), 'global': d[1].to(device), 'action_mask': d[2].to(device)}}
-            logits = model(input_dict)
-            loss = F.cross_entropy(logits, d[3].long().to(device))
-            if i % 128 == 0:
-                print('Iteration %d/%d' % (i, len(trainDataset) // args.batch_size + 1), 'policy_loss', loss.item())
-            optimizer.zero_grad()
-            loss.backward()
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            batch_count = len(d[3])
-            train_loss_sum += loss.item() * batch_count
-            train_count += batch_count
+        train_order = train_chunks[:]
+        rng.shuffle(train_order)
+        iteration = 0
+        for _, chunk_payload in _iter_loaded_chunks(train_data_dir, train_order, args.prefetch_chunks):
+            for d in _iter_train_batches(chunk_payload, args.batch_size, rng):
+                loss_value, batch_count = _train_batch(model, optimizer, d, device, args.grad_clip)
+                if iteration % 128 == 0:
+                    print('Iteration %d/%d' % (iteration, train_batches), 'policy_loss', loss_value)
+                train_loss_sum += loss_value * batch_count
+                train_count += batch_count
+                iteration += 1
+            del chunk_payload
         print('Run validation:')
         correct = 0
         val_count = 0
-        for i, d in enumerate(vloader):
-            input_dict = {'is_training': False, 'obs': {'observation': d[0].to(device), 'global': d[1].to(device), 'action_mask': d[2].to(device)}}
-            with torch.no_grad():
-                logits = model(input_dict)
-                pred = logits.argmax(dim = 1)
-                correct += torch.eq(pred, d[3].to(device)).sum().item()
-                val_count += len(d[3])
+        with torch.no_grad():
+            for _, chunk_payload in _iter_loaded_chunks(valid_data_dir, valid_chunks, args.prefetch_chunks):
+                for d in _iter_eval_batches(chunk_payload, args.batch_size):
+                    obs, glob, mask, act = _to_device(d, device)
+                    input_dict = {'is_training': False, 'obs': {'observation': obs, 'global': glob, 'action_mask': mask}}
+                    logits = model(input_dict)
+                    pred = logits.argmax(dim = 1)
+                    correct += torch.eq(pred, act).sum().item()
+                    val_count += len(act)
+                del chunk_payload
         acc = correct / val_count if val_count else 0.0
         avg_loss = train_loss_sum / train_count if train_count else 0.0
         print('Epoch', e + 1, 'Validate acc:', acc)
         _append_metrics_row(metrics_path, {
             'epoch': e + 1,
-            'mode': 'legacy',
+            'mode': 'local',
             'train_loss': avg_loss,
             'validate_acc': acc,
             'train_samples': train_count,
@@ -329,39 +297,25 @@ def _run_legacy_training(args, manifest, device, base_dir):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Supervised training for MahjongGB')
-    # Toggle here to switch default training data source.
-    # USE_OBS_IO = False
-    USE_OBS_IO = True
-    # Change this to your actual OBS bucket name.
-    BUCKET_NAME = 'mahjong-data'
-    OBS_DATA_PREFIX = f'obs://{BUCKET_NAME}/SL/data'
-    # DATA_DIR = 'data'
-    # DATA_DIR = OBS_DATA_PREFIX
-    DATA_DIR = OBS_DATA_PREFIX if USE_OBS_IO else 'data'
-    parser.add_argument('--data-dir', type = str, default = DATA_DIR, help = 'Directory containing data.txt, count.json, and *.npz')
+    parser.add_argument('--train-data-dir', type = str, default = 'data/train', help = 'Local training directory containing count.json and chunk_*.npz files')
+    parser.add_argument('--valid-data-dir', type = str, default = 'data/valid', help = 'Local validation directory containing count.json and chunk_*.npz files')
     parser.add_argument('--logdir', type = str, default = None, help = 'Directory for checkpoints and logs')
-    parser.add_argument('--split-ratio', type = float, default = 0.9)
     parser.add_argument('--batch-size', type = int, default = 1024)
     parser.add_argument('--epochs', type = int, default = 20)
     parser.add_argument('--lr', type = float, default = 5e-4)
     parser.add_argument('--weight-decay', type = float, default = 1e-4)
     parser.add_argument('--grad-clip', type = float, default = 1.0)
     parser.add_argument('--device', type = str, default = 'auto', choices = ['auto', 'cpu', 'cuda', 'npu'])
-    parser.add_argument('--num-workers', type = int, default = 0)
+    parser.add_argument('--prefetch-chunks', type = int, default = 1, help = 'Number of local npz chunks to load in the background')
     parser.add_argument('--metrics-file', type = str, default = None, help = 'CSV file for per-epoch metrics')
     parser.add_argument('--resume', type = str, default = None, help = 'Checkpoint path to continue training from')
     parser.add_argument('--start-epoch', type = int, default = 0, help = 'Epoch number used for resumed checkpoint naming and metrics')
     parser.add_argument('--append-metrics', action = 'store_true', help = 'Append to an existing metrics CSV instead of replacing it')
-    parser.add_argument('--split-seed', type = int, default = 20240616, help = 'Seed used for fixed sharded train/validation split')
     parser.add_argument('--patience', type = int, default = 3, help = 'Stop after this many consecutive epochs without validation improvement; use -1 to disable')
+    parser.add_argument('--seed', type = int, default = 20240618, help = 'Random seed for chunk order and in-chunk shuffling')
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent
     device = _resolve_device(args.device)
-    print('Using device:', device)
 
-    manifest = load_manifest(args.data_dir)
-    if isinstance(manifest, dict) and manifest.get('schema') == 'sharded-v1':
-        _run_sharded_training(args, manifest, device, base_dir)
-    else:
-        _run_legacy_training(args, manifest, device, base_dir)
+    _run_local_training(args, device, base_dir)

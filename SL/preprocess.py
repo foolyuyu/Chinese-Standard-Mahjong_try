@@ -1,67 +1,46 @@
 from feature import FeatureAgent
-import argparse
 import json
-import os
-import shutil
-import tempfile
 from pathlib import Path
 
 import numpy as np
 
+from augmentation import sample_variant, transform_batch
 
-# Toggle here when you want to switch between local disk and OBS.
-# USE_OBS_IO = False
-USE_OBS_IO = True
 
-# Change this to your actual OBS bucket name.
-BUCKET_NAME = 'mahjong-data'
-OBS_DATA_PREFIX = f'obs://{BUCKET_NAME}/SL/data'
-
-# Toggle here when you want to switch between one-match-per-file and sharded output.
-# USE_SHARDS = False
-USE_SHARDS = True
-
-# Tune this if you want bigger or smaller shard files.
-SHARD_SAMPLE_LIMIT = 90000
-
-# Local mode:
-# INPUT_FILE = 'data/data.txt'
-# OUTPUT_DIR = 'data'
-
-# OBS mode:
-# INPUT_FILE = f'{OBS_DATA_PREFIX}/data.txt'
-# OUTPUT_DIR = OBS_DATA_PREFIX
-
-INPUT_FILE = f'{OBS_DATA_PREFIX}/data.txt' if USE_OBS_IO else 'data/data.txt'
-OUTPUT_DIR = OBS_DATA_PREFIX if USE_OBS_IO else 'data'
+INPUT_FILE = 'data/data.txt'
+OUTPUT_DIR = 'data'
+SPLIT_RATIO = 0.95
+AUGMENT_SAFE_MATCHES = True
+AUGMENT_SEED = 20240618
+CHUNK_SAMPLE_LIMIT = 500000
+RISKY_FAN_NAMES = {
+    '绿一色',
+    '推不倒',
+}
 
 obs = [[] for _ in range(4)]
 actions = [[] for _ in range(4)]
 matchid = -1
-l = []
+augmented_matches = 0
+risky_matches = 0
 base_dir = Path(__file__).resolve().parent
-
-if USE_SHARDS:
-    shard_id = 0
-    shard_sample_count = 0
-    shard_match_counts = []
-    shard_obs = []
-    shard_glob = []
-    shard_mask = []
-    shard_act = []
-    shard_manifest = []
-
-
-def _is_obs_path(path):
-    return str(path).startswith('obs://')
-
-
-def _load_mox():
-    try:
-        import moxing as mox  # type: ignore
-    except Exception:
-        return None
-    return mox
+rng = np.random.default_rng(seed = AUGMENT_SEED)
+split_manifests = {
+    'train': {'schema': 'local-chunk-v1', 'chunk_sample_limit': CHUNK_SAMPLE_LIMIT, 'total_samples': 0, 'chunks': []},
+    'valid': {'schema': 'local-chunk-v1', 'chunk_sample_limit': CHUNK_SAMPLE_LIMIT, 'total_samples': 0, 'chunks': []},
+}
+split_output_ids = {
+    'train': 0,
+    'valid': 0,
+}
+chunk_buffers = {
+    'train': {'obs': [], 'glob': [], 'mask': [], 'act': []},
+    'valid': {'obs': [], 'glob': [], 'mask': [], 'act': []},
+}
+chunk_sample_counts = {
+    'train': 0,
+    'valid': 0,
+}
 
 
 def _resolve_local_path(path):
@@ -70,44 +49,12 @@ def _resolve_local_path(path):
 
 
 def _save_npz(output_dir, name, **payload):
-    if _is_obs_path(output_dir):
-        mox = _load_mox()
-        if mox is None:
-            raise RuntimeError('OBS output requires moxing in ModelArts.')
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix = '.npz', delete = False) as tmp:
-                tmp_path = tmp.name
-            np.savez(tmp_path, **payload)
-            dest = f"{str(output_dir).rstrip('/')}/{name}.npz"
-            mox.file.copy(tmp_path, dest)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        return
-
     output_path = _resolve_local_path(output_dir)
     output_path.mkdir(parents = True, exist_ok = True)
     np.savez(output_path / f'{name}.npz', **payload)
 
 
 def _save_json(output_dir, name, payload):
-    if _is_obs_path(output_dir):
-        mox = _load_mox()
-        if mox is None:
-            raise RuntimeError('OBS output requires moxing in ModelArts.')
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(mode = 'w', suffix = '.json', encoding = 'utf-8', delete = False) as tmp:
-                tmp_path = tmp.name
-                json.dump(payload, tmp)
-            dest = f"{str(output_dir).rstrip('/')}/{name}.json"
-            mox.file.copy(tmp_path, dest)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        return
-
     output_path = _resolve_local_path(output_dir)
     output_path.mkdir(parents = True, exist_ok = True)
     with open(output_path / f'{name}.json', 'w', encoding = 'utf-8') as f:
@@ -115,16 +62,18 @@ def _save_json(output_dir, name, payload):
 
 
 def _open_input_file(input_file):
-    if _is_obs_path(input_file):
-        mox = _load_mox()
-        if mox is None:
-            raise RuntimeError('OBS input requires moxing in ModelArts.')
-        tmp_dir = tempfile.mkdtemp(prefix = 'sl_preprocess_')
-        local_path = os.path.join(tmp_dir, Path(str(input_file)).name or 'data.txt')
-        mox.file.copy(str(input_file), local_path)
-        return open(local_path, encoding = 'UTF-8'), tmp_dir
+    return open(_resolve_local_path(input_file), encoding = 'UTF-8')
 
-    return open(_resolve_local_path(input_file), encoding = 'UTF-8'), None
+
+def _prepare_output_dirs():
+    for split_name in ['train', 'valid']:
+        split_dir = _resolve_local_path(Path(OUTPUT_DIR) / split_name)
+        split_dir.mkdir(parents = True, exist_ok = True)
+        for old_npz in split_dir.glob('*.npz'):
+            old_npz.unlink()
+        count_path = split_dir / 'count.json'
+        if count_path.exists():
+            count_path.unlink()
 
 
 def filterData():
@@ -144,10 +93,9 @@ def filterData():
 def _materialize_match():
     assert [len(x) for x in obs] == [len(x) for x in actions], 'obs actions not matching!'
     match_samples = sum([len(x) for x in obs])
-    l.append(match_samples)
     payload = {
         'obs': np.stack([x['observation'] for i in range(4) for x in obs[i]]).astype(np.int8),
-        'glob': np.stack([x['global'] for i in range(4) for x in obs[i]]).astype(np.int8),
+        'glob': np.stack([x['global'] for i in range(4) for x in obs[i]]).astype(np.float32),
         'mask': np.stack([x['action_mask'] for i in range(4) for x in obs[i]]).astype(np.int8),
         'act': np.array([x for i in range(4) for x in actions[i]]),
     }
@@ -161,67 +109,56 @@ def _clear_match_buffers():
         x.clear()
 
 
-def _flush_shard():
-    global shard_id
-    global shard_sample_count
-    global shard_match_counts
-    global shard_obs
-    global shard_glob
-    global shard_mask
-    global shard_act
-    global shard_manifest
+def _has_risky_fan(fan_description):
+    return any(name in fan_description for name in RISKY_FAN_NAMES)
 
-    if shard_sample_count == 0:
+
+def _flush_chunk(split_name):
+    sample_count = chunk_sample_counts[split_name]
+    if sample_count == 0:
         return
-
+    chunk_id = split_output_ids[split_name]
+    filename = 'chunk_%05d.npz' % chunk_id
     payload = {
-        'obs': np.concatenate(shard_obs, axis = 0),
-        'glob': np.concatenate(shard_glob, axis = 0),
-        'mask': np.concatenate(shard_mask, axis = 0),
-        'act': np.concatenate(shard_act, axis = 0),
-        'match_counts': np.array(shard_match_counts, dtype = np.int32),
+        key: np.concatenate(chunk_buffers[split_name][key], axis = 0)
+        for key in chunk_buffers[split_name]
     }
-    _save_npz(OUTPUT_DIR, f'shard_{shard_id:05d}', **payload)
-    print('Saved shard %d with %d samples and %d matches.' % (shard_id, shard_sample_count, len(shard_match_counts)))
-    shard_manifest.append({
-        'file': f'shard_{shard_id:05d}.npz',
-        'samples': int(shard_sample_count),
-        'matches': int(len(shard_match_counts)),
-        'match_counts': [int(x) for x in shard_match_counts],
-    })
-    shard_id += 1
-    shard_sample_count = 0
-    shard_match_counts = []
-    shard_obs = []
-    shard_glob = []
-    shard_mask = []
-    shard_act = []
+    _save_npz(Path(OUTPUT_DIR) / split_name, filename[:-4], **payload)
+    split_manifests[split_name]['chunks'].append({'file': filename, 'samples': int(sample_count)})
+    split_manifests[split_name]['total_samples'] += int(sample_count)
+    split_output_ids[split_name] = chunk_id + 1
+    chunk_sample_counts[split_name] = 0
+    for values in chunk_buffers[split_name].values():
+        values.clear()
 
 
-def _append_match_to_shard(match_samples, payload):
-    global shard_sample_count
-    global shard_match_counts
-    global shard_obs
-    global shard_glob
-    global shard_mask
-    global shard_act
-
-    if shard_sample_count and shard_sample_count + match_samples > SHARD_SAMPLE_LIMIT:
-        _flush_shard()
-
-    shard_sample_count += match_samples
-    shard_match_counts.append(match_samples)
-    shard_obs.append(payload['obs'])
-    shard_glob.append(payload['glob'])
-    shard_mask.append(payload['mask'])
-    shard_act.append(payload['act'])
-
-    if shard_sample_count >= SHARD_SAMPLE_LIMIT:
-        _flush_shard()
+def _append_payload_to_chunk(split_name, payload):
+    sample_count = len(payload['act'])
+    if sample_count == 0:
+        return
+    for key in chunk_buffers[split_name]:
+        chunk_buffers[split_name][key].append(payload[key])
+    chunk_sample_counts[split_name] += sample_count
+    if chunk_sample_counts[split_name] >= CHUNK_SAMPLE_LIMIT:
+        _flush_chunk(split_name)
 
 
-f, _tmp_dir = _open_input_file(INPUT_FILE)
+def _merge_payloads(first, second):
+    return {
+        'obs': np.concatenate([first['obs'], second['obs']], axis = 0),
+        'glob': np.concatenate([first['glob'], second['glob']], axis = 0),
+        'mask': np.concatenate([first['mask'], second['mask']], axis = 0),
+        'act': np.concatenate([first['act'], second['act']], axis = 0),
+    }
+
+
+_prepare_output_dirs()
+f = _open_input_file(INPUT_FILE)
 try:
+    fan_description = ''
+    total_matches = sum(1 for line in f if line.startswith('Match '))
+    split_matchid = int(total_matches * SPLIT_RATIO)
+    f.seek(0)
     line = f.readline()
     while line:
         t = line.split()
@@ -231,6 +168,7 @@ try:
         if t[0] == 'Match':
             agents = [FeatureAgent(i) for i in range(4)]
             matchid += 1
+            fan_description = ''
             if matchid % 128 == 0:
                 print('Processing match %d %s...' % (matchid, t[1]))
         elif t[0] == 'Wind':
@@ -319,29 +257,32 @@ try:
                             actions[p].append(agents[p].response2action('Hu'))
                     else:
                         break
+        elif t[0] == 'Fan':
+            fan_description = line
         elif t[0] == 'Score':
+            was_augmented = False
             filterData()
-            if USE_SHARDS:
-                match_samples, payload = _materialize_match()
-                _append_match_to_shard(match_samples, payload)
-            else:
-                match_samples, payload = _materialize_match()
-                _save_npz(OUTPUT_DIR, '%d' % matchid, **payload)
+            _, payload = _materialize_match()
+            risky_fan = _has_risky_fan(fan_description)
+            split_name = 'train' if matchid < split_matchid else 'valid'
+            if split_name == 'train' and AUGMENT_SAFE_MATCHES and not risky_fan:
+                variant = sample_variant(rng, honor_weight = 1.0)
+                payload = _merge_payloads(payload, transform_batch(payload, variant))
+                was_augmented = True
+            if risky_fan:
+                risky_matches += 1
+            if was_augmented:
+                augmented_matches += 1
+            _append_payload_to_chunk(split_name, payload)
             _clear_match_buffers()
         line = f.readline()
 finally:
     f.close()
-    if _tmp_dir is not None:
-        shutil.rmtree(_tmp_dir, ignore_errors = True)
 
-if USE_SHARDS:
-    _flush_shard()
-    _save_json(OUTPUT_DIR, 'count', {
-        'schema': 'sharded-v1',
-        'shard_sample_limit': SHARD_SAMPLE_LIMIT,
-        'total_matches': len(l),
-        'total_samples': int(sum(l)),
-        'shards': shard_manifest,
-    })
-else:
-    _save_json(OUTPUT_DIR, 'count', l)
+_flush_chunk('train')
+_flush_chunk('valid')
+_save_json(Path(OUTPUT_DIR) / 'train', 'count', split_manifests['train'])
+_save_json(Path(OUTPUT_DIR) / 'valid', 'count', split_manifests['valid'])
+print('Saved %d train chunk npz files and %d valid chunk npz files.' % (split_output_ids['train'], split_output_ids['valid']))
+print('Saved %d train samples and %d valid samples.' % (split_manifests['train']['total_samples'], split_manifests['valid']['total_samples']))
+print('Augmented %d train matches; kept %d risky-fan matches unaugmented.' % (augmented_matches, risky_matches))
