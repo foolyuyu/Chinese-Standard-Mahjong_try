@@ -188,6 +188,30 @@ def _count_batches(chunks, batch_size):
     return sum((int(chunk['samples']) + batch_size - 1) // batch_size for chunk in chunks)
 
 
+def _concat_payloads(payloads):
+    return {
+        key: np.concatenate([payload[key] for payload in payloads], axis = 0)
+        for key in payloads[0]
+    }
+
+
+def _load_all_chunks(data_dir, chunks, split_name):
+    payloads = []
+    loaded_samples = 0
+    for idx, chunk in enumerate(chunks):
+        payload = _load_chunk(data_dir, chunk)
+        payloads.append(payload)
+        loaded_samples += len(payload['act'])
+        print('Loaded %s chunk %d/%d samples=%d total=%d' % (
+            split_name,
+            idx + 1,
+            len(chunks),
+            len(payload['act']),
+            loaded_samples,
+        ))
+    return _concat_payloads(payloads)
+
+
 def _take_indexed_batch(payload, indices):
     return {key: value[indices] for key, value in payload.items()}
 
@@ -230,6 +254,12 @@ def _run_local_training(args, device, base_dir):
     print('Valid samples:', valid_manifest['total_samples'], 'chunks:', len(valid_chunks))
     if train_manifest['schema'] == 'legacy-match-v1':
         print('Warning: training data uses legacy per-match npz files. Re-run preprocess.py for faster chunked loading.')
+    print('Loading all training chunks into memory for global shuffle...')
+    train_payload = _load_all_chunks(train_data_dir, train_chunks, 'train')
+    print('Loaded all training samples into memory:', len(train_payload['act']))
+    print('Loading all validation chunks into memory...')
+    valid_payload = _load_all_chunks(valid_data_dir, valid_chunks, 'valid')
+    print('Loaded all validation samples into memory:', len(valid_payload['act']))
     model = CNNModel().to(device)
     _load_resume_checkpoint(model, args.resume, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr = args.lr, weight_decay = args.weight_decay)
@@ -243,31 +273,25 @@ def _run_local_training(args, device, base_dir):
         _save_cpu_checkpoint(model, logdir / 'checkpoint' / ('%d.pkl' % e))
         train_loss_sum = 0.0
         train_count = 0
-        train_order = train_chunks[:]
-        rng.shuffle(train_order)
         iteration = 0
-        for _, chunk_payload in _iter_loaded_chunks(train_data_dir, train_order, args.prefetch_chunks):
-            for d in _iter_train_batches(chunk_payload, args.batch_size, rng):
-                loss_value, batch_count = _train_batch(model, optimizer, d, device, args.grad_clip)
-                if iteration % 128 == 0:
-                    print('Iteration %d/%d' % (iteration, train_batches), 'policy_loss', loss_value)
-                train_loss_sum += loss_value * batch_count
-                train_count += batch_count
-                iteration += 1
-            del chunk_payload
+        for d in _iter_train_batches(train_payload, args.batch_size, rng):
+            loss_value, batch_count = _train_batch(model, optimizer, d, device, args.grad_clip)
+            if iteration % 128 == 0:
+                print('Iteration %d/%d' % (iteration, train_batches), 'policy_loss', loss_value)
+            train_loss_sum += loss_value * batch_count
+            train_count += batch_count
+            iteration += 1
         print('Run validation:')
         correct = 0
         val_count = 0
         with torch.no_grad():
-            for _, chunk_payload in _iter_loaded_chunks(valid_data_dir, valid_chunks, args.prefetch_chunks):
-                for d in _iter_eval_batches(chunk_payload, args.batch_size):
-                    obs, glob, mask, act = _to_device(d, device)
-                    input_dict = {'is_training': False, 'obs': {'observation': obs, 'global': glob, 'action_mask': mask}}
-                    logits = model(input_dict)
-                    pred = logits.argmax(dim = 1)
-                    correct += torch.eq(pred, act).sum().item()
-                    val_count += len(act)
-                del chunk_payload
+            for d in _iter_eval_batches(valid_payload, args.batch_size):
+                obs, glob, mask, act = _to_device(d, device)
+                input_dict = {'is_training': False, 'obs': {'observation': obs, 'global': glob, 'action_mask': mask}}
+                logits = model(input_dict)
+                pred = logits.argmax(dim = 1)
+                correct += torch.eq(pred, act).sum().item()
+                val_count += len(act)
         acc = correct / val_count if val_count else 0.0
         avg_loss = train_loss_sum / train_count if train_count else 0.0
         print('Epoch', e + 1, 'Validate acc:', acc)
