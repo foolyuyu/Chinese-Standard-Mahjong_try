@@ -1,4 +1,5 @@
 from feature import FeatureAgent
+import argparse
 import json
 from pathlib import Path
 
@@ -11,6 +12,7 @@ INPUT_FILE = 'data/data.txt'
 OUTPUT_DIR = 'data'
 SPLIT_RATIO = 0.95
 AUGMENT_SAFE_MATCHES = True
+AUGMENT_COPIES = 1
 AUGMENT_SEED = 20240618
 CHUNK_SAMPLE_LIMIT = 500000
 RISKY_FAN_NAMES = {
@@ -22,6 +24,7 @@ obs = [[] for _ in range(4)]
 actions = [[] for _ in range(4)]
 matchid = -1
 augmented_matches = 0
+augmented_payloads = 0
 risky_matches = 0
 base_dir = Path(__file__).resolve().parent
 rng = np.random.default_rng(seed = AUGMENT_SEED)
@@ -63,6 +66,44 @@ def _save_json(output_dir, name, payload):
 
 def _open_input_file(input_file):
     return open(_resolve_local_path(input_file), encoding = 'UTF-8')
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description = 'Preprocess MahjongGB SL data into local train/valid npz chunks.')
+    parser.add_argument('--input-file', type = str, default = INPUT_FILE)
+    parser.add_argument('--output-dir', type = str, default = OUTPUT_DIR)
+    parser.add_argument('--split-ratio', type = float, default = SPLIT_RATIO)
+    parser.add_argument('--augment-copies', type = int, default = AUGMENT_COPIES, help = 'Augmented copies per safe training match. 0 disables augmentation; 1 means original + one transformed copy.')
+    parser.add_argument('--augment-seed', type = int, default = AUGMENT_SEED)
+    parser.add_argument('--chunk-sample-limit', type = int, default = CHUNK_SAMPLE_LIMIT)
+    return parser.parse_args()
+
+
+def _apply_args(args):
+    global INPUT_FILE
+    global OUTPUT_DIR
+    global SPLIT_RATIO
+    global AUGMENT_SAFE_MATCHES
+    global AUGMENT_COPIES
+    global AUGMENT_SEED
+    global CHUNK_SAMPLE_LIMIT
+    global rng
+
+    if args.augment_copies < 0:
+        raise ValueError('--augment-copies must be >= 0')
+    if not 0 < args.split_ratio < 1:
+        raise ValueError('--split-ratio must be between 0 and 1')
+
+    INPUT_FILE = args.input_file
+    OUTPUT_DIR = args.output_dir
+    SPLIT_RATIO = args.split_ratio
+    AUGMENT_COPIES = args.augment_copies
+    AUGMENT_SAFE_MATCHES = AUGMENT_COPIES > 0
+    AUGMENT_SEED = args.augment_seed
+    CHUNK_SAMPLE_LIMIT = args.chunk_sample_limit
+    rng = np.random.default_rng(seed = AUGMENT_SEED)
+    for manifest in split_manifests.values():
+        manifest['chunk_sample_limit'] = CHUNK_SAMPLE_LIMIT
 
 
 def _prepare_output_dirs():
@@ -152,6 +193,7 @@ def _merge_payloads(first, second):
     }
 
 
+_apply_args(_parse_args())
 _prepare_output_dirs()
 f = _open_input_file(INPUT_FILE)
 try:
@@ -266,9 +308,14 @@ try:
             risky_fan = _has_risky_fan(fan_description)
             split_name = 'train' if matchid < split_matchid else 'valid'
             if split_name == 'train' and AUGMENT_SAFE_MATCHES and not risky_fan:
-                variant = sample_variant(rng, honor_weight = 1.0)
-                payload = _merge_payloads(payload, transform_batch(payload, variant))
+                augmented = []
+                for _ in range(AUGMENT_COPIES):
+                    variant = sample_variant(rng, honor_weight = 1.0)
+                    augmented.append(transform_batch(payload, variant))
+                for augmented_payload in augmented:
+                    payload = _merge_payloads(payload, augmented_payload)
                 was_augmented = True
+                augmented_payloads += len(augmented)
             if risky_fan:
                 risky_matches += 1
             if was_augmented:
@@ -285,4 +332,4 @@ _save_json(Path(OUTPUT_DIR) / 'train', 'count', split_manifests['train'])
 _save_json(Path(OUTPUT_DIR) / 'valid', 'count', split_manifests['valid'])
 print('Saved %d train chunk npz files and %d valid chunk npz files.' % (split_output_ids['train'], split_output_ids['valid']))
 print('Saved %d train samples and %d valid samples.' % (split_manifests['train']['total_samples'], split_manifests['valid']['total_samples']))
-print('Augmented %d train matches; kept %d risky-fan matches unaugmented.' % (augmented_matches, risky_matches))
+print('Augmented %d train matches with %d extra transformed copies; kept %d risky-fan matches unaugmented.' % (augmented_matches, augmented_payloads, risky_matches))

@@ -3,35 +3,62 @@ import torch
 from torch import nn
 
 
+class ResidualBlock(nn.Module):
+
+    def __init__(self, channels):
+        nn.Module.__init__(self)
+        self._block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, 1, 1, bias = False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, 3, 1, 1, bias = False),
+            nn.BatchNorm2d(channels)
+        )
+        self._relu = nn.ReLU()
+
+    def forward(self, x):
+        return self._relu(x + self._block(x))
+
+
 class CNNModel(nn.Module):
 
     OBS_CHANNELS = 148
     GLOBAL_SIZE = 10
+    RES_CHANNELS = 128
+    RES_BLOCKS = 6
+    HEAD_SIZE = 512
 
     def __init__(self):
         nn.Module.__init__(self)
         self._tower = nn.Sequential(
-            nn.Conv2d(self.OBS_CHANNELS, 128, 3, 1, 1, bias = False),
-            nn.ReLU(True),
-            nn.Conv2d(128, 128, 3, 1, 1, bias = False),
-            nn.ReLU(True),
-            nn.Conv2d(128, 64, 3, 1, 1, bias = False),
-            nn.ReLU(True),
+            nn.Conv2d(self.OBS_CHANNELS, 192, 3, 1, 1, bias = False),
+            nn.BatchNorm2d(192),
+            nn.ReLU(),
+            nn.Conv2d(192, self.RES_CHANNELS, 3, 1, 1, bias = False),
+            nn.BatchNorm2d(self.RES_CHANNELS),
+            nn.ReLU(),
+            *[ResidualBlock(self.RES_CHANNELS) for _ in range(self.RES_BLOCKS)],
+            nn.ReLU(),
             nn.Flatten()
         )
         self._global_tower = nn.Sequential(
-            nn.Linear(self.GLOBAL_SIZE, 32),
-            nn.ReLU(True)
+            nn.Linear(self.GLOBAL_SIZE, 64),
+            nn.ReLU()
         )
         self._tower_head = nn.Sequential(
-            nn.Linear(64 * 4 * 9 + 32, 256),
+            nn.Linear(self.RES_CHANNELS * 4 * 9 + 64, self.HEAD_SIZE),
             nn.ReLU(),
-            nn.Linear(256, 235)
+            nn.Linear(self.HEAD_SIZE, 235)
         )
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight)
+                if getattr(m, 'bias', None) is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def _pad_obs(self, obs):
         if obs.size(1) == self.OBS_CHANNELS:
